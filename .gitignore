@@ -34,4 +34,5 @@ htmlcov/
 Thumbs.db
 
 data/
+export/
 contexto.md

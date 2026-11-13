@@ -165,3 +165,15 @@ class TestLoadSettings:
         )
         settings = load_settings(env_path=env_file)
         assert settings.admin_telegram_ids == (12345, 67890)
+
+    def test_load_settings_gemini_multi_keys(self, tmp_path):
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "TELEGRAM_BOT_TOKEN=token\n"
+            "USE_GEMINI=true\n"
+            "GEMINI_API_KEY=key1\n"
+            "GEMINI_API_KEYS=key1, key2, key3\n"
+        )
+        settings = load_settings(env_path=env_file)
+        assert settings.gemini_api_key == "key1"
+        assert settings.gemini_api_keys == ("key1", "key2", "key3")

@@ -1,0 +1,17 @@
+.venv
+.venv-wsl
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+tests
+.git
+.gitignore
+.env
+contexto.md
+data/db.sqlite3
+data/db.sqlite3-*
+data/tickets.xlsx
+data/images/*
+export/
+!data/images/.gitkeep

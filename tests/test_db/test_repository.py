@@ -205,3 +205,126 @@ class TestRolesAndAccountingRepo:
                 movement_type="INVALIDO", amount=10.0,
             )
 
+
+class TestUnassignmentDeletionAndDeduplication:
+    def test_desasignacion_reduces_assigned_and_net_balance(self, repo: Repository):
+        admin = repo.create_user(telegram_id=1, name="Jefa", role="admin")
+        worker = repo.create_user(telegram_id=2, name="Lucas", role="trabajador")
+
+        repo.create_cash_movement(user_id=worker.id, created_by_id=admin.id, movement_type="ASIGNACION", amount=100.0)
+        repo.create_cash_movement(user_id=worker.id, created_by_id=admin.id, movement_type="DESASIGNACION", amount=40.0, note="Error")
+
+        bal = repo.get_user_balance(worker.id)
+        assert bal.total_assigned == 60.0
+        assert bal.month_assigned == 60.0
+        assert bal.net_balance == 60.0
+
+    def test_delete_cash_movement_and_ticket(self, repo: Repository):
+        admin = repo.create_user(telegram_id=1, name="Jefa", role="admin")
+        worker = repo.create_user(telegram_id=2, name="Mario", role="trabajador")
+        mov = repo.create_cash_movement(user_id=worker.id, created_by_id=admin.id, movement_type="ASIGNACION", amount=500.0)
+        tkt = repo.create_ticket(
+            user_id=worker.id, image_path="/img/x.jpg",
+            empresa="Bar", nif="", descripcion="Café", total=2.5, fecha="13/11/2026",
+        )
+
+        deleted_mov = repo.delete_cash_movement(mov.id)
+        assert deleted_mov is not None and deleted_mov.amount == 500.0
+        assert repo.get_movement_by_id(mov.id) is None
+
+        deleted_tkt = repo.delete_ticket(tkt.id)
+        assert deleted_tkt is not None and deleted_tkt.id == tkt.id
+        assert repo.get_ticket_by_id(tkt.id) is None
+        assert repo.get_user_balance(worker.id).net_balance == 0.0
+
+    def test_update_name_and_delete_dummy_worker(self, repo: Repository):
+        dummy_empty = repo.create_dummy_worker("Test Borrar")
+        dummy_busy = repo.create_dummy_worker("Con Datos")
+        repo.create_ticket(
+            user_id=dummy_busy.id, image_path="/img/b.jpg",
+            empresa="Tienda", nif="", descripcion="Algo", total=5.0, fecha="13/11/2026",
+        )
+
+        repo.update_user_name(dummy_busy.id, "Nombre Oficial")
+        assert repo.get_user_by_id(dummy_busy.id).name == "Nombre Oficial"
+
+        assert repo.delete_dummy_worker(dummy_empty.id) is True
+        assert repo.delete_dummy_worker(dummy_busy.id) is False  # Has ticket
+
+    def test_global_duplicate_detection_respects_date_window(self, repo: Repository):
+        w1 = repo.create_user(telegram_id=10, name="Carlos")
+        repo.create_user(telegram_id=20, name="Ana")
+
+        # Recent ticket uploaded by w1
+        recent = repo.create_ticket(
+            user_id=w1.id,
+            image_path="/img/1.jpg",
+            empresa="Restaurante Montemayor SL",
+            nif="B90321852",
+            descripcion="Menú",
+            total=28.40,
+            fecha="13/11/2026",
+            image_sha256="abc123sha",
+            image_dhash="0f0f0f0f0f0f0f0f",
+        )
+        # Old ticket outside 90-day window
+        old = repo.create_ticket(
+            user_id=w1.id,
+            image_path="/img/old.jpg",
+            empresa="Antiguo Bar SL",
+            nif="",
+            descripcion="Café",
+            total=15.0,
+            fecha="01/01/2025",
+            image_sha256="oldsha",
+            image_dhash="aaaaaaaaaaaaaaaa",
+        )
+        with repo._connect() as conn:
+            conn.execute("UPDATE tickets SET created_at = '2025-01-01 10:00:00' WHERE id = ?", (old.id,))
+
+        # 1. Exact SHA-256 hit across whole company
+        hit_sha = repo.find_duplicate_by_image_hash("abc123sha", "")
+        assert hit_sha is not None
+        assert hit_sha[0].id == recent.id
+        assert hit_sha[1] == "Carlos"
+        assert hit_sha[2] == "exact"
+
+        # 2. Visual dHash (1 bit difference) hit inside 90-day window
+        hit_dhash = repo.find_duplicate_by_image_hash("different_sha", "0f0f0f0f0f0f0f0e", max_hamming=4, days_window=90)
+        assert hit_dhash is not None
+        assert hit_dhash[0].id == recent.id
+        assert hit_dhash[2] == "visual"
+
+        # 3. Old dHash outside 90-day window must NOT trigger scan/match
+        assert repo.find_duplicate_by_image_hash("other", "aaaaaaaaaaaaaaab", max_hamming=4, days_window=90) is None
+
+        # 4. Semantic match via indexed (fecha, total) + fuzzy company
+        hit_data = repo.find_duplicate_by_data("Montemayor", 28.40, "13/11/2026", days_window=90)
+        assert hit_data is not None and hit_data[0].id == recent.id
+
+        # 5. Old data ticket outside 90-day window ignored
+        assert repo.find_duplicate_by_data("Antiguo Bar SL", 15.0, "01/01/2025", days_window=90) is None
+
+    def test_sync_admin_roles_promotes_and_demotes(self, repo: Repository):
+        ex_admin = repo.create_user(telegram_id=101, name="Ex Jefa", role="admin")
+        new_admin = repo.create_user(telegram_id=202, name="Nueva Jefa", role="trabajador")
+        worker = repo.create_user(telegram_id=303, name="Currito", role="trabajador")
+        dummy = repo.create_dummy_worker("Sin Telegram")
+
+        # Promote 202 and demote 101 (removed from .env ADMIN_TELEGRAM_IDS)
+        promoted, demoted = repo.sync_admin_roles((202,))
+        assert promoted == 1
+        assert demoted == 1
+        assert repo.get_user_by_id(ex_admin.id).role == "trabajador"
+        assert repo.get_user_by_id(new_admin.id).role == "admin"
+        assert repo.get_user_by_id(worker.id).role == "trabajador"
+        assert repo.get_user_by_id(dummy.id).role == "trabajador"
+        assert [u.telegram_id for u in repo.get_admins()] == [202]
+
+        # Empty ADMIN_TELEGRAM_IDS removes all admin roles from SQLite
+        promoted2, demoted2 = repo.sync_admin_roles(())
+        assert promoted2 == 0
+        assert demoted2 == 1
+        assert repo.get_user_by_id(new_admin.id).role == "trabajador"
+        assert repo.get_admins() == []
+

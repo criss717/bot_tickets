@@ -34,6 +34,8 @@ class Ticket:
     total: float
     fecha: str
     synced_to_excel: bool = False
+    image_sha256: str = ""
+    image_dhash: str = ""
     created_at: datetime | None = None
     id: Optional[int] = None
 
@@ -44,11 +46,11 @@ class Ticket:
 
 @dataclass
 class CashMovement:
-    """A cash movement (assignment, return, or out-of-pocket cash)."""
+    """A cash movement (assignment, unassignment, return, or out-of-pocket cash)."""
 
     user_id: int
     created_by_id: int
-    movement_type: str  # 'ASIGNACION', 'DEVOLUCION', 'APORTE_PROPIO'
+    movement_type: str  # 'ASIGNACION', 'DESASIGNACION', 'DEVOLUCION', 'APORTE_PROPIO'
     amount: float
     note: str = ""
     fecha: str = ""

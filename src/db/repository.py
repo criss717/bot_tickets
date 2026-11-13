@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Generator
 
 from db.models import CashMovement, MonthlyWorkerSummary, Ticket, User, UserBalance
+from ocr.dedup import companies_match, hamming_distance
 
 
 SCHEMA_SQL = """
@@ -30,6 +31,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     total REAL NOT NULL,
     fecha TEXT NOT NULL,
     synced_to_excel INTEGER DEFAULT 0,
+    image_sha256 TEXT DEFAULT '',
+    image_dhash TEXT DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
@@ -80,12 +83,19 @@ class Repository:
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
 
-            # Safe migration for existing tickets table: synced_to_excel
+            # Safe migration for existing tickets table: synced_to_excel & dedup hashes
             cursor = conn.execute("PRAGMA table_info(tickets)")
             existing_ticket_columns = {row["name"] for row in cursor.fetchall()}
             if "synced_to_excel" not in existing_ticket_columns:
                 conn.execute("ALTER TABLE tickets ADD COLUMN synced_to_excel INTEGER DEFAULT 0")
+            if "image_sha256" not in existing_ticket_columns:
+                conn.execute("ALTER TABLE tickets ADD COLUMN image_sha256 TEXT DEFAULT ''")
+            if "image_dhash" not in existing_ticket_columns:
+                conn.execute("ALTER TABLE tickets ADD COLUMN image_dhash TEXT DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_synced ON tickets(synced_to_excel)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_sha256 ON tickets(image_sha256)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_fecha_total ON tickets(fecha, total)")
 
             # Safe migration for existing users table: role
             cursor = conn.execute("PRAGMA table_info(users)")
@@ -95,6 +105,41 @@ class Repository:
 
             # Safe migration for cash_movements indexes
             conn.execute("CREATE INDEX IF NOT EXISTS idx_movements_synced ON cash_movements(synced_to_excel)")
+
+    @staticmethod
+    def _row_to_ticket(row: sqlite3.Row) -> Ticket:
+        """Convert a SQLite row from `tickets` into a Ticket dataclass."""
+        keys = row.keys()
+        return Ticket(
+            id=row["id"],
+            user_id=row["user_id"],
+            image_path=row["image_path"],
+            empresa=row["empresa"],
+            nif=row["nif"] if "nif" in keys else "",
+            descripcion=row["descripcion"],
+            total=row["total"],
+            fecha=row["fecha"],
+            synced_to_excel=bool(row["synced_to_excel"]) if "synced_to_excel" in keys else False,
+            image_sha256=row["image_sha256"] if "image_sha256" in keys and row["image_sha256"] else "",
+            image_dhash=row["image_dhash"] if "image_dhash" in keys and row["image_dhash"] else "",
+            created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _row_to_movement(row: sqlite3.Row) -> CashMovement:
+        """Convert a SQLite row from `cash_movements` into a CashMovement dataclass."""
+        keys = row.keys()
+        return CashMovement(
+            id=row["id"],
+            user_id=row["user_id"],
+            created_by_id=row["created_by_id"],
+            movement_type=row["movement_type"],
+            amount=row["amount"],
+            note=row["note"] if "note" in keys else "",
+            fecha=row["fecha"],
+            synced_to_excel=bool(row["synced_to_excel"]),
+            created_at=row["created_at"],
+        )
 
     # ── Users ─────────────────────────────────────────────────────────────
 
@@ -154,6 +199,30 @@ class Repository:
                 (role, telegram_id_or_id, telegram_id_or_id),
             )
 
+    def sync_admin_roles(self, admin_telegram_ids: tuple[int, ...] | set[int]) -> tuple[int, int]:
+        """Synchronize DB roles so ADMIN_TELEGRAM_IDS is the single source of truth.
+
+        Promotes real users in admin_telegram_ids to 'admin' and demotes anyone else
+        who still had role='admin' in SQLite back to 'trabajador'.
+        Returns (promoted_count, demoted_count).
+        """
+        admin_set = {tid for tid in admin_telegram_ids if tid > 0}
+        promoted = 0
+        demoted = 0
+        with self._connect() as conn:
+            rows = conn.execute("SELECT id, telegram_id, role FROM users").fetchall()
+            for row in rows:
+                tid = row["telegram_id"]
+                current_role = row["role"] or "trabajador"
+                should_be_admin = tid in admin_set
+                if should_be_admin and current_role != "admin":
+                    conn.execute("UPDATE users SET role = 'admin' WHERE id = ?", (row["id"],))
+                    promoted += 1
+                elif not should_be_admin and current_role == "admin":
+                    conn.execute("UPDATE users SET role = 'trabajador' WHERE id = ?", (row["id"],))
+                    demoted += 1
+        return promoted, demoted
+
     def get_all_users(self) -> list[User]:
         """Get all registered users ordered by ID."""
         with self._connect() as conn:
@@ -201,6 +270,24 @@ class Repository:
                 role="trabajador",
             )
 
+    def update_user_name(self, user_id: int, new_name: str) -> None:
+        """Update display name for an existing user."""
+        with self._connect() as conn:
+            conn.execute("UPDATE users SET name = ? WHERE id = ?", (new_name.strip(), user_id))
+
+    def delete_dummy_worker(self, user_id: int) -> bool:
+        """Delete a test worker (telegram_id < 0) if they have zero tickets and zero movements."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT telegram_id FROM users WHERE id = ?", (user_id,)).fetchone()
+            if row is None or row["telegram_id"] >= 0:
+                return False
+            cnt_t = conn.execute("SELECT COUNT(*) as c FROM tickets WHERE user_id = ?", (user_id,)).fetchone()["c"]
+            cnt_m = conn.execute("SELECT COUNT(*) as c FROM cash_movements WHERE user_id = ?", (user_id,)).fetchone()["c"]
+            if cnt_t > 0 or cnt_m > 0:
+                return False
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            return True
+
     # ── Tickets ───────────────────────────────────────────────────────────
 
     def create_ticket(
@@ -213,14 +300,16 @@ class Repository:
         total: float,
         fecha: str,
         synced_to_excel: bool = False,
+        image_sha256: str = "",
+        image_dhash: str = "",
     ) -> Ticket:
         """Create a new ticket record."""
         with self._connect() as conn:
             cursor = conn.execute(
                 """INSERT INTO tickets
-                   (user_id, image_path, empresa, nif, descripcion, total, fecha, synced_to_excel)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (user_id, image_path, empresa, nif, descripcion, total, fecha, int(synced_to_excel)),
+                   (user_id, image_path, empresa, nif, descripcion, total, fecha, synced_to_excel, image_sha256, image_dhash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, image_path, empresa, nif, descripcion, total, fecha, int(synced_to_excel), image_sha256, image_dhash),
             )
             return Ticket(
                 id=cursor.lastrowid,
@@ -232,6 +321,8 @@ class Repository:
                 total=total,
                 fecha=fecha,
                 synced_to_excel=synced_to_excel,
+                image_sha256=image_sha256,
+                image_dhash=image_dhash,
             )
 
     def get_ticket_by_id(self, ticket_id: int) -> Ticket | None:
@@ -241,20 +332,7 @@ class Repository:
                 "SELECT * FROM tickets WHERE id = ?",
                 (ticket_id,),
             ).fetchone()
-            if row is None:
-                return None
-            return Ticket(
-                id=row["id"],
-                user_id=row["user_id"],
-                image_path=row["image_path"],
-                empresa=row["empresa"],
-                nif=row["nif"] if "nif" in row.keys() else "",
-                descripcion=row["descripcion"],
-                total=row["total"],
-                fecha=row["fecha"],
-                synced_to_excel=bool(row["synced_to_excel"]) if "synced_to_excel" in row.keys() else False,
-                created_at=row["created_at"],
-            )
+            return self._row_to_ticket(row) if row is not None else None
 
     def get_tickets_by_user(self, user_id: int) -> list[Ticket]:
         """Get all tickets for a specific user."""
@@ -263,21 +341,109 @@ class Repository:
                 "SELECT * FROM tickets WHERE user_id = ? ORDER BY id DESC",
                 (user_id,),
             ).fetchall()
-            return [
-                Ticket(
-                    id=row["id"],
-                    user_id=row["user_id"],
-                    image_path=row["image_path"],
-                    empresa=row["empresa"],
-                    nif=row["nif"] if "nif" in row.keys() else "",
-                    descripcion=row["descripcion"],
-                    total=row["total"],
-                    fecha=row["fecha"],
-                    synced_to_excel=bool(row["synced_to_excel"]) if "synced_to_excel" in row.keys() else False,
-                    created_at=row["created_at"],
-                )
-                for row in rows
-            ]
+            return [self._row_to_ticket(row) for row in rows]
+
+    def get_recent_tickets(self, user_id: int | None = None, limit: int = 8) -> list[tuple[Ticket, str]]:
+        """Get recent tickets (all users or specific user) ordered newest first."""
+        with self._connect() as conn:
+            if user_id is not None:
+                rows = conn.execute(
+                    """SELECT t.*, u.name as user_name FROM tickets t
+                       JOIN users u ON t.user_id = u.id
+                       WHERE t.user_id = ?
+                       ORDER BY t.id DESC LIMIT ?""",
+                    (user_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT t.*, u.name as user_name FROM tickets t
+                       JOIN users u ON t.user_id = u.id
+                       ORDER BY t.id DESC LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            return [(self._row_to_ticket(row), row["user_name"]) for row in rows]
+
+    def delete_ticket(self, ticket_id: int) -> Ticket | None:
+        """Delete a ticket from DB and return the removed Ticket (or None if missing)."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+            if row is None:
+                return None
+            ticket = self._row_to_ticket(row)
+            conn.execute("DELETE FROM tickets WHERE id = ?", (ticket_id,))
+            return ticket
+
+    def find_duplicate_by_image_hash(
+        self,
+        sha256: str,
+        dhash: str = "",
+        max_hamming: int = 4,
+        days_window: int = 90,
+    ) -> tuple[Ticket, str, str] | None:
+        """Check globally if an identical or visually near-identical photo already exists.
+
+        Uses indexed SHA-256 lookup first, then bounds perceptual dHash comparison
+        by `created_at` (`days_window`) to keep query latency constant on large DBs.
+        """
+        with self._connect() as conn:
+            if sha256:
+                row = conn.execute(
+                    """SELECT t.*, u.name as user_name
+                       FROM tickets t
+                       JOIN users u ON t.user_id = u.id
+                       WHERE t.image_sha256 = ?
+                       ORDER BY t.id DESC LIMIT 1""",
+                    (sha256,),
+                ).fetchone()
+                if row is not None:
+                    return (self._row_to_ticket(row), row["user_name"], "exact")
+
+            if dhash:
+                rows = conn.execute(
+                    """SELECT t.*, u.name as user_name
+                       FROM tickets t
+                       JOIN users u ON t.user_id = u.id
+                       WHERE t.image_dhash != ''
+                         AND t.created_at >= datetime('now', ?)
+                       ORDER BY t.id DESC
+                       LIMIT 1000""",
+                    (f"-{int(days_window)} days",),
+                ).fetchall()
+                best: tuple[int, sqlite3.Row] | None = None
+                for row in rows:
+                    dist = hamming_distance(dhash, row["image_dhash"])
+                    if dist <= max_hamming and (best is None or dist < best[0]):
+                        best = (dist, row)
+                if best is not None:
+                    return (self._row_to_ticket(best[1]), best[1]["user_name"], "visual")
+        return None
+
+    def find_duplicate_by_data(
+        self,
+        empresa: str,
+        total: float,
+        fecha: str,
+        days_window: int = 90,
+    ) -> tuple[Ticket, str] | None:
+        """Check globally via composite (fecha, total) index if a matching receipt exists."""
+        if total <= 0.0 or not fecha:
+            return None
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT t.*, u.name as user_name
+                   FROM tickets t
+                   JOIN users u ON t.user_id = u.id
+                   WHERE t.fecha = ?
+                     AND ROUND(t.total, 2) = ROUND(?, 2)
+                     AND t.created_at >= datetime('now', ?)
+                   ORDER BY t.id DESC
+                   LIMIT 25""",
+                (fecha, float(total), f"-{int(days_window)} days"),
+            ).fetchall()
+            for row in rows:
+                if companies_match(row["empresa"], empresa):
+                    return (self._row_to_ticket(row), row["user_name"])
+        return None
 
     def count_tickets_by_user(self, user_id: int) -> int:
         """Count tickets for a user."""
@@ -302,22 +468,7 @@ class Repository:
                    WHERE t.synced_to_excel = 0
                    ORDER BY t.id ASC""",
             ).fetchall()
-            result = []
-            for row in rows:
-                t = Ticket(
-                    id=row["id"],
-                    user_id=row["user_id"],
-                    image_path=row["image_path"],
-                    empresa=row["empresa"],
-                    nif=row["nif"] if "nif" in row.keys() else "",
-                    descripcion=row["descripcion"],
-                    total=row["total"],
-                    fecha=row["fecha"],
-                    synced_to_excel=bool(row["synced_to_excel"]),
-                    created_at=row["created_at"],
-                )
-                result.append((t, row["user_name"]))
-            return result
+            return [(self._row_to_ticket(row), row["user_name"]) for row in rows]
 
     def get_all_tickets_with_users(self) -> list[tuple[Ticket, str]]:
         """Get all tickets with user names ordered by ID."""
@@ -328,22 +479,7 @@ class Repository:
                    JOIN users u ON t.user_id = u.id
                    ORDER BY t.id ASC""",
             ).fetchall()
-            result = []
-            for row in rows:
-                t = Ticket(
-                    id=row["id"],
-                    user_id=row["user_id"],
-                    image_path=row["image_path"],
-                    empresa=row["empresa"],
-                    nif=row["nif"] if "nif" in row.keys() else "",
-                    descripcion=row["descripcion"],
-                    total=row["total"],
-                    fecha=row["fecha"],
-                    synced_to_excel=bool(row["synced_to_excel"]) if "synced_to_excel" in row.keys() else False,
-                    created_at=row["created_at"],
-                )
-                result.append((t, row["user_name"]))
-            return result
+            return [(self._row_to_ticket(row), row["user_name"]) for row in rows]
 
     def mark_tickets_synced(self, ticket_ids: list[int]) -> None:
         """Mark a list of tickets as synchronized to Excel."""
@@ -386,8 +522,8 @@ class Repository:
         note: str = "",
         fecha: str | None = None,
     ) -> CashMovement:
-        """Record a cash movement (ASIGNACION, DEVOLUCION, APORTE_PROPIO)."""
-        valid_types = {"ASIGNACION", "DEVOLUCION", "APORTE_PROPIO"}
+        """Record a cash movement (ASIGNACION, DESASIGNACION, DEVOLUCION, APORTE_PROPIO)."""
+        valid_types = {"ASIGNACION", "DESASIGNACION", "DEVOLUCION", "APORTE_PROPIO"}
         if movement_type not in valid_types:
             raise ValueError(f"Invalid movement_type: {movement_type}. Must be one of {valid_types}")
 
@@ -427,21 +563,7 @@ class Repository:
                    WHERE m.synced_to_excel = 0
                    ORDER BY m.id ASC""",
             ).fetchall()
-            result = []
-            for row in rows:
-                m = CashMovement(
-                    id=row["id"],
-                    user_id=row["user_id"],
-                    created_by_id=row["created_by_id"],
-                    movement_type=row["movement_type"],
-                    amount=row["amount"],
-                    note=row["note"] if "note" in row.keys() else "",
-                    fecha=row["fecha"],
-                    synced_to_excel=bool(row["synced_to_excel"]),
-                    created_at=row["created_at"],
-                )
-                result.append((m, row["worker_name"], row["creator_name"]))
-            return result
+            return [(self._row_to_movement(row), row["worker_name"], row["creator_name"]) for row in rows]
 
     def get_all_movements_with_users(self) -> list[tuple[CashMovement, str, str]]:
         """Get all cash movements with user and creator names."""
@@ -453,21 +575,60 @@ class Repository:
                    JOIN users c ON m.created_by_id = c.id
                    ORDER BY m.id ASC""",
             ).fetchall()
-            result = []
-            for row in rows:
-                m = CashMovement(
-                    id=row["id"],
-                    user_id=row["user_id"],
-                    created_by_id=row["created_by_id"],
-                    movement_type=row["movement_type"],
-                    amount=row["amount"],
-                    note=row["note"] if "note" in row.keys() else "",
-                    fecha=row["fecha"],
-                    synced_to_excel=bool(row["synced_to_excel"]),
-                    created_at=row["created_at"],
-                )
-                result.append((m, row["worker_name"], row["creator_name"]))
-            return result
+            return [(self._row_to_movement(row), row["worker_name"], row["creator_name"]) for row in rows]
+
+    def get_recent_movements(
+        self,
+        user_id: int | None = None,
+        limit: int = 8,
+    ) -> list[tuple[CashMovement, str, str]]:
+        """Get recent cash movements (optionally filtered by worker) newest first."""
+        with self._connect() as conn:
+            if user_id is not None:
+                rows = conn.execute(
+                    """SELECT m.*, u.name as worker_name, c.name as creator_name
+                       FROM cash_movements m
+                       JOIN users u ON m.user_id = u.id
+                       JOIN users c ON m.created_by_id = c.id
+                       WHERE m.user_id = ?
+                       ORDER BY m.id DESC LIMIT ?""",
+                    (user_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT m.*, u.name as worker_name, c.name as creator_name
+                       FROM cash_movements m
+                       JOIN users u ON m.user_id = u.id
+                       JOIN users c ON m.created_by_id = c.id
+                       ORDER BY m.id DESC LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            return [(self._row_to_movement(row), row["worker_name"], row["creator_name"]) for row in rows]
+
+    def get_movement_by_id(self, movement_id: int) -> tuple[CashMovement, str, str] | None:
+        """Fetch a single cash movement along with worker and creator names."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT m.*, u.name as worker_name, c.name as creator_name
+                   FROM cash_movements m
+                   JOIN users u ON m.user_id = u.id
+                   JOIN users c ON m.created_by_id = c.id
+                   WHERE m.id = ?""",
+                (movement_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return (self._row_to_movement(row), row["worker_name"], row["creator_name"])
+
+    def delete_cash_movement(self, movement_id: int) -> CashMovement | None:
+        """Delete a cash movement by ID and return it (or None if not found)."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM cash_movements WHERE id = ?", (movement_id,)).fetchone()
+            if row is None:
+                return None
+            mov = self._row_to_movement(row)
+            conn.execute("DELETE FROM cash_movements WHERE id = ?", (movement_id,))
+            return mov
 
     def mark_movements_synced(self, movement_ids: list[int]) -> None:
         """Mark cash movements as synchronized to Excel."""
@@ -507,7 +668,13 @@ class Repository:
         with self._connect() as conn:
             # 1. Historical totals (all-time)
             row_asig = conn.execute(
-                "SELECT COALESCE(SUM(amount), 0.0) as s FROM cash_movements WHERE user_id = ? AND movement_type = 'ASIGNACION'",
+                """SELECT COALESCE(SUM(
+                       CASE
+                           WHEN movement_type = 'ASIGNACION' THEN amount
+                           WHEN movement_type = 'DESASIGNACION' THEN -amount
+                           ELSE 0.0
+                       END
+                   ), 0.0) as s FROM cash_movements WHERE user_id = ?""",
                 (user_id,),
             ).fetchone()
             total_assigned = float(row_asig["s"])
@@ -532,8 +699,14 @@ class Repository:
 
             # 2. Monthly activity (target_ym)
             row_m_asig = conn.execute(
-                """SELECT COALESCE(SUM(amount), 0.0) as s FROM cash_movements
-                   WHERE user_id = ? AND movement_type = 'ASIGNACION' AND strftime('%Y-%m', created_at) = ?""",
+                """SELECT COALESCE(SUM(
+                       CASE
+                           WHEN movement_type = 'ASIGNACION' THEN amount
+                           WHEN movement_type = 'DESASIGNACION' THEN -amount
+                           ELSE 0.0
+                       END
+                   ), 0.0) as s FROM cash_movements
+                   WHERE user_id = ? AND strftime('%Y-%m', created_at) = ?""",
                 (user_id, target_ym),
             ).fetchone()
             month_assigned = float(row_m_asig["s"])
@@ -612,8 +785,14 @@ class Repository:
                     continue
 
                 r_asig = conn.execute(
-                    """SELECT COALESCE(SUM(amount), 0.0) as s FROM cash_movements
-                       WHERE user_id = ? AND movement_type = 'ASIGNACION' AND strftime('%Y-%m', created_at) = ?""",
+                    """SELECT COALESCE(SUM(
+                           CASE
+                               WHEN movement_type = 'ASIGNACION' THEN amount
+                               WHEN movement_type = 'DESASIGNACION' THEN -amount
+                               ELSE 0.0
+                           END
+                       ), 0.0) as s FROM cash_movements
+                       WHERE user_id = ? AND strftime('%Y-%m', created_at) = ?""",
                     (uid, ym),
                 ).fetchone()
                 asig = float(r_asig["s"])

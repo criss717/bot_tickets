@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -101,6 +103,33 @@ def _setup_sheet_headers(ws, columns: list[tuple[str, int]]) -> None:
         ws.column_dimensions[col_letter].width = width
 
 
+def _save_workbook_atomic(wb: Workbook, excel_path: Path) -> None:
+    """Save workbook atomically via same-directory temp file with 0644 permissions for Samba read-only sharing."""
+    excel_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=excel_path.parent,
+            prefix=".tmp_",
+            suffix=".xlsx",
+            delete=False,
+        ) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+
+        wb.save(tmp_path)
+        try:
+            os.chmod(tmp_path, 0o644)
+        except OSError:
+            pass
+        os.replace(tmp_path, excel_path)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def ensure_workbook(excel_path: Path) -> None:
     """Ensure the Excel file exists with all 4 required sheets."""
     excel_path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,7 +155,7 @@ def ensure_workbook(excel_path: Path) -> None:
         _setup_sheet_headers(ws_caja, COLUMNS_CAJA)
 
         wb.active = ws_tickets
-        wb.save(excel_path)
+        _save_workbook_atomic(wb, excel_path)
         return
 
     # If it exists, ensure all 4 sheets are present
@@ -154,7 +183,7 @@ def ensure_workbook(excel_path: Path) -> None:
         dirty = True
 
     if dirty:
-        wb.save(excel_path)
+        _save_workbook_atomic(wb, excel_path)
 
 
 def append_ticket(excel_path: Path, user_name: str, ticket: Ticket) -> int:
@@ -183,7 +212,7 @@ def append_ticket(excel_path: Path, user_name: str, ticket: Ticket) -> int:
     if ws.max_row > 1:
         ws.auto_filter.ref = ws.dimensions
 
-    wb.save(excel_path)
+    _save_workbook_atomic(wb, excel_path)
     return next_row
 
 
@@ -368,7 +397,7 @@ def sync_pending_tickets(excel_path: Path, repo: Repository) -> tuple[int, bool]
         update_mensual_sheet(ws_mensual, summaries)
 
         wb.active = ws_tickets
-        wb.save(excel_path)
+        _save_workbook_atomic(wb, excel_path)
 
         if synced_ticket_ids:
             repo.mark_tickets_synced(synced_ticket_ids)
@@ -456,7 +485,7 @@ def rebuild_excel_from_db(excel_path: Path, repo: Repository) -> tuple[int, bool
             ws_caja.auto_filter.ref = ws_caja.dimensions
 
         wb.active = ws_tickets
-        wb.save(excel_path)
+        _save_workbook_atomic(wb, excel_path)
 
         if synced_ticket_ids:
             repo.mark_tickets_synced(synced_ticket_ids)

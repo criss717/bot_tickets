@@ -282,4 +282,25 @@ class TestMultiSheetAccounting:
         assert ws_resumen.cell(row=row_debe, column=3).number_format == "#,##0.00 €"
         assert ws_resumen.cell(row=row_debe, column=7).number_format == "#,##0.00 €"
 
+    def test_desasignacion_updates_resumen_and_cleans_temp_files(self, excel_path: Path, repo: Repository):
+        admin = repo.create_user(telegram_id=1, name="Jefa", role="admin")
+        worker = repo.create_user(telegram_id=2, name="Pepe", role="trabajador")
+
+        repo.create_cash_movement(user_id=worker.id, created_by_id=admin.id, movement_type="ASIGNACION", amount=100.0)
+        repo.create_cash_movement(user_id=worker.id, created_by_id=admin.id, movement_type="DESASIGNACION", amount=100.0, note="Equivocación")
+
+        synced, ok = sync_pending_tickets(excel_path, repo)
+        assert ok is True and synced == 2
+
+        wb = load_workbook(excel_path)
+        ws_resumen = wb["Resumen Cuentas"]
+        for r in range(2, ws_resumen.max_row + 1):
+            if ws_resumen.cell(row=r, column=1).value == "Pepe":
+                assert ws_resumen.cell(row=r, column=3).value == 0.0
+                assert ws_resumen.cell(row=r, column=7).value == 0.0
+                assert "PAZ Y SALVO" in ws_resumen.cell(row=r, column=8).value
+                break
+        # Ensure atomic save left zero leftover temp files
+        assert [p for p in excel_path.parent.glob(".tmp_*")] == []
+
 

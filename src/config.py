@@ -26,7 +26,8 @@ class Settings:
     ollama_url: str = "http://localhost:11434/v1"
     use_gemini: bool = False
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_api_keys: tuple[str, ...] = ()
+    gemini_model: str = "gemini-3.5-flash-lite"
     db_path: Path = field(default_factory=lambda: Path("data/db.sqlite3"))
     excel_path: Path = field(default_factory=lambda: Path("data/tickets.xlsx"))
     images_dir: Path = field(default_factory=lambda: Path("data/images"))
@@ -59,11 +60,20 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
     openai_key = os.getenv("OPENAI_API_KEY", "")
     is_local = os.getenv("IS_LOCAL_IA", "false").lower() in ("true", "1", "yes")
     use_gemini = os.getenv("USE_GEMINI", os.getenv("IS_GEMINI", "false")).lower() in ("true", "1", "yes")
-    gemini_key = os.getenv("GEMINI_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
+    gemini_key = os.getenv("GEMINI_API_KEY", os.getenv("GOOGLE_API_KEY", "")).strip()
+    raw_gemini_keys = os.getenv("GEMINI_API_KEYS", "")
+    gemini_keys_list: list[str] = []
+    if gemini_key:
+        gemini_keys_list.append(gemini_key)
+    for k in raw_gemini_keys.split(","):
+        k = k.strip()
+        if k and k not in gemini_keys_list:
+            gemini_keys_list.append(k)
+    effective_gemini_key = gemini_keys_list[0] if gemini_keys_list else ""
 
     if not telegram_token:
         raise ValueError("TELEGRAM_BOT_TOKEN is required")
-    if use_gemini and not gemini_key:
+    if use_gemini and not gemini_keys_list:
         raise ValueError("GEMINI_API_KEY is required when USE_GEMINI=true")
     if not is_local and not use_gemini and not openai_key:
         raise ValueError("OPENAI_API_KEY is required (set IS_LOCAL_IA=true or USE_GEMINI=true)")
@@ -94,8 +104,9 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
         ollama_model=os.getenv("OLLAMA_MODEL", "glm-ocr"),
         ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434/v1"),
         use_gemini=use_gemini,
-        gemini_api_key=gemini_key,
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+        gemini_api_key=effective_gemini_key,
+        gemini_api_keys=tuple(gemini_keys_list),
+        gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
         db_path=db_path,
         excel_path=excel_path,
         images_dir=images_dir,

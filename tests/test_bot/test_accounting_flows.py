@@ -459,3 +459,134 @@ class TestCancelFlows:
         await h_cancel_cb(cb, state)
         assert await state.get_state() is None
         assert "Acción cancelada" in cb.message.answer.call_args[0][0]
+
+
+# ── Quick Amount Cards, Unassignment & Security Hardening ─────────────────
+
+class TestQuickCardsAndUnassignmentFlows:
+    @pytest.mark.asyncio
+    async def test_assign_quick_amount_card_50(self, repo: Repository, storage: MemoryStorage, tmp_path: Path):
+        admin = repo.create_user(telegram_id=999, name="La Jefa", role="admin")
+        worker = repo.create_user(telegram_id=101, name="Juan", role="trabajador")
+
+        mock_bot = MagicMock(spec=Bot)
+        mock_bot.send_message = AsyncMock()
+        mock_extractor = MagicMock(spec=VisionExtractor)
+        router = create_router(repo, mock_extractor, mock_bot, tmp_path / "img", tmp_path / "t.xlsx", (999,))
+
+        state = make_fsm_context(storage, chat_id=999, user_id=999)
+        await state.update_data(target_worker_id=worker.id, target_worker_name=worker.name)
+        await state.set_state(AssignMoneyStates.waiting_for_amount)
+
+        h_card = get_handler_by_name(router, "handle_assign_amount_card")
+        cb = MagicMock(spec=CallbackQuery)
+        cb.data = "asig_amt:50"
+        cb.from_user = TgUser(id=999, is_bot=False, first_name="La Jefa")
+        cb.message = MagicMock()
+        cb.message.edit_text = AsyncMock()
+        cb.message.answer = AsyncMock()
+        cb.answer = AsyncMock()
+
+        await h_card(cb, state)
+        assert await state.get_state() == AssignMoneyStates.waiting_for_note.state
+        assert (await state.get_data())["amount"] == 50.0
+
+    @pytest.mark.asyncio
+    async def test_unassign_custom_and_void_movement_flows(self, repo: Repository, storage: MemoryStorage, tmp_path: Path):
+        admin = repo.create_user(telegram_id=999, name="La Jefa", role="admin")
+        worker = repo.create_user(telegram_id=101, name="Juan", role="trabajador")
+        m_wrong = repo.create_cash_movement(user_id=worker.id, created_by_id=admin.id, movement_type="ASIGNACION", amount=500.0)
+        m_real = repo.create_cash_movement(user_id=worker.id, created_by_id=admin.id, movement_type="ASIGNACION", amount=100.0)
+
+        mock_bot = MagicMock(spec=Bot)
+        mock_bot.send_message = AsyncMock()
+        mock_extractor = MagicMock(spec=VisionExtractor)
+        excel_path = tmp_path / "t.xlsx"
+        router = create_router(repo, mock_extractor, mock_bot, tmp_path / "img", excel_path, (999,))
+
+        # 1. Admin voids the mistaken 500 € movement
+        h_mov_del = get_handler_by_name(router, "handle_movement_delete")
+        cb_del = MagicMock(spec=CallbackQuery)
+        cb_del.data = f"mov_del:{m_wrong.id}"
+        cb_del.from_user = TgUser(id=999, is_bot=False, first_name="La Jefa")
+        cb_del.message = MagicMock()
+        cb_del.message.edit_text = AsyncMock()
+        cb_del.answer = AsyncMock()
+
+        await h_mov_del(cb_del)
+        assert repo.get_movement_by_id(m_wrong.id) is None
+        assert repo.get_user_balance(worker.id).net_balance == 100.0
+        assert mock_bot.send_message.call_count == 1
+        assert "500.00 €" in mock_bot.send_message.call_args.kwargs["text"]
+
+        # 2. Admin partially unassigns 40 € via quick card / FSM
+        state = make_fsm_context(storage, chat_id=999, user_id=999)
+        await state.update_data(target_worker_id=worker.id, target_worker_name=worker.name, amount=40.0)
+        from bot.handlers import UnassignMoneyStates
+        await state.set_state(UnassignMoneyStates.waiting_for_note)
+
+        h_unassign_note = get_handler_by_name(router, "handle_unassign_note")
+        msg_note = MagicMock(spec=Message)
+        msg_note.from_user = TgUser(id=999, is_bot=False, first_name="La Jefa")
+        msg_note.text = "Retiro sobrante"
+        msg_note.answer = AsyncMock()
+
+        await h_unassign_note(msg_note, state)
+        assert await state.get_state() is None
+        assert repo.get_user_balance(worker.id).net_balance == 60.0
+        assert excel_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_rbac_callbacks_and_idor_blocked_and_fsm_interruption(self, repo: Repository, storage: MemoryStorage, tmp_path: Path):
+        admin = repo.create_user(telegram_id=999, name="La Jefa", role="admin")
+        w1 = repo.create_user(telegram_id=101, name="Trabajador 1", role="trabajador")
+        w2 = repo.create_user(telegram_id=102, name="Trabajador 2", role="trabajador")
+        tkt_w2 = repo.create_ticket(
+            user_id=w2.id, image_path="/img/t2.jpg",
+            empresa="Bar", nif="", descripcion="Café", total=10.0, fecha="13/11/2026",
+        )
+
+        mock_bot = MagicMock(spec=Bot)
+        mock_extractor = MagicMock(spec=VisionExtractor)
+        router = create_router(repo, mock_extractor, mock_bot, tmp_path / "img", tmp_path / "t.xlsx", (999,))
+
+        # Non-admin attempts admin callback asig_worker
+        state_w1 = make_fsm_context(storage, chat_id=101, user_id=101)
+        h_asig = get_handler_by_name(router, "handle_assign_worker_chosen")
+        cb_attack = MagicMock(spec=CallbackQuery)
+        cb_attack.data = f"asig_worker:{w2.id}"
+        cb_attack.from_user = TgUser(id=101, is_bot=False, first_name="Trabajador 1")
+        cb_attack.answer = AsyncMock()
+        await h_asig(cb_attack, state_w1)
+        assert await state_w1.get_state() is None
+        assert "exclusiva para la Jefa" in cb_attack.answer.call_args[0][0]
+
+        # Non-admin attempts Excel download callback
+        h_xl = get_handler_by_name(router, "handle_excel_download")
+        cb_xl = MagicMock(spec=CallbackQuery)
+        cb_xl.data = "excel_download"
+        cb_xl.from_user = TgUser(id=101, is_bot=False, first_name="Trabajador 1")
+        cb_xl.answer = AsyncMock()
+        await h_xl(cb_xl)
+        assert "exclusiva para la Jefa" in cb_xl.answer.call_args[0][0]
+
+        # IDOR: Worker 1 cannot edit Worker 2's ticket
+        h_edit = get_handler_by_name(router, "handle_ticket_edit_start")
+        cb_idor = MagicMock(spec=CallbackQuery)
+        cb_idor.data = f"tkt_edit:{tkt_w2.id}"
+        cb_idor.from_user = TgUser(id=101, is_bot=False, first_name="Trabajador 1")
+        cb_idor.answer = AsyncMock()
+        await h_edit(cb_idor, state_w1)
+        assert "No tenés permiso" in cb_idor.answer.call_args[0][0]
+        assert await state_w1.get_state() is None
+
+        # FSM Interruption: Menu button clears stuck AssignMoney state cleanly
+        state_admin = make_fsm_context(storage, chat_id=999, user_id=999)
+        await state_admin.set_state(AssignMoneyStates.waiting_for_amount)
+        h_summary = get_handler_by_name(router, "handle_summary")
+        msg_menu = MagicMock(spec=Message)
+        msg_menu.from_user = TgUser(id=999, is_bot=False, first_name="La Jefa")
+        msg_menu.answer = AsyncMock()
+        await h_summary(msg_menu, state_admin)
+        assert await state_admin.get_state() is None
+        assert "SALDO NETO" in msg_menu.answer.call_args[0][0]

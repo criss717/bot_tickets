@@ -1,0 +1,24 @@
+services:
+  bot_tickets:
+    build:
+      context: .
+      args:
+        APP_UID: 1000
+        APP_GID: 1000
+    container_name: bot_tickets
+    restart: unless-stopped
+    user: "1000:1000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data     # Privado: SQLite + fotos (no compartir por Samba)
+      - ./export:/app/export # Compartido Samba: solo tickets.xlsx en solo lectura
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
