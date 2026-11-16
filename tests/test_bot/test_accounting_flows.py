@@ -344,7 +344,7 @@ class TestReturnMoneyFSMFlow:
         # Check balance: 100 - 35.50 = 64.50 €
         bal = repo.get_user_balance(worker.id)
         assert bal.net_balance == 64.50
-        assert "DEBE A LA JEFA" in bal.status_label
+        assert "DEBE A LA EMPRESA" in bal.status_label
 
         # Admins must have been notified
         mock_bot.send_message.assert_called_once()
@@ -559,7 +559,7 @@ class TestQuickCardsAndUnassignmentFlows:
         cb_attack.answer = AsyncMock()
         await h_asig(cb_attack, state_w1)
         assert await state_w1.get_state() is None
-        assert "exclusiva para la Jefa" in cb_attack.answer.call_args[0][0]
+        assert "exclusiva para Administradores" in cb_attack.answer.call_args[0][0]
 
         # Non-admin attempts Excel download callback
         h_xl = get_handler_by_name(router, "handle_excel_download")
@@ -568,7 +568,7 @@ class TestQuickCardsAndUnassignmentFlows:
         cb_xl.from_user = TgUser(id=101, is_bot=False, first_name="Trabajador 1")
         cb_xl.answer = AsyncMock()
         await h_xl(cb_xl)
-        assert "exclusiva para la Jefa" in cb_xl.answer.call_args[0][0]
+        assert "exclusiva para Administradores" in cb_xl.answer.call_args[0][0]
 
         # IDOR: Worker 1 cannot edit Worker 2's ticket
         h_edit = get_handler_by_name(router, "handle_ticket_edit_start")

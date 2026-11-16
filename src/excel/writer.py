@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import zipfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils.exceptions import InvalidFileException
 
 from db.models import CashMovement, MonthlyWorkerSummary, Ticket, UserBalance
 
@@ -51,6 +53,7 @@ COLUMNS_TICKETS = [
     ("Total", 14),
     ("Fecha", 14),
     ("Mes Liquidación", 16),
+    ("Foto", 34),
 ]
 
 COLUMNS_CAJA = [
@@ -69,6 +72,7 @@ HEADER_ALIGNMENT = Alignment(horizontal="center", vertical="center")
 
 TOTAL_FONT = Font(bold=True, color="000000", size=11)
 TOTAL_FILL = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+LINK_FONT = Font(color="0563C1", underline="single")
 
 # Traffic-light styles for account status
 FILL_PAZ = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
@@ -186,6 +190,81 @@ def ensure_workbook(excel_path: Path) -> None:
         _save_workbook_atomic(wb, excel_path)
 
 
+def _write_ticket_row(ws_tickets, row_idx: int, user_name: str, ticket: Ticket, excel_path: Path) -> None:
+    """Write a single ticket row cleanly including clickable photo link when stored under export/."""
+    month_liq = _format_created_month(ticket.created_at)
+    ws_tickets.cell(row=row_idx, column=1, value=user_name)
+    ws_tickets.cell(row=row_idx, column=2, value=ticket.empresa)
+    ws_tickets.cell(row=row_idx, column=3, value=ticket.nif)
+    ws_tickets.cell(row=row_idx, column=4, value=ticket.descripcion)
+    c_total = ws_tickets.cell(row=row_idx, column=5, value=float(ticket.total))
+    c_total.number_format = "#,##0.00 €"
+    ws_tickets.cell(row=row_idx, column=6, value=ticket.fecha)
+    ws_tickets.cell(row=row_idx, column=7, value=month_liq)
+
+    c_photo = ws_tickets.cell(row=row_idx, column=8)
+    if not ticket.image_path:
+        c_photo.value = ""
+        return
+
+    img_path = Path(ticket.image_path)
+    try:
+        rel_posix = img_path.resolve().relative_to(excel_path.parent.resolve()).as_posix()
+        c_photo.value = rel_posix
+        c_photo.hyperlink = rel_posix
+        c_photo.font = LINK_FONT
+    except ValueError:
+        c_photo.value = img_path.name
+
+
+def _write_movement_row(
+    ws_caja,
+    row_idx: int,
+    worker_name: str,
+    mov: CashMovement,
+    creator_name: str,
+) -> None:
+    """Write a single cash movement row consistently."""
+    month_mov = _format_created_month(mov.created_at)
+    ws_caja.cell(row=row_idx, column=1, value=worker_name)
+    ws_caja.cell(row=row_idx, column=2, value=mov.movement_type)
+    c_amt = ws_caja.cell(row=row_idx, column=3, value=float(mov.amount))
+    c_amt.number_format = "#,##0.00 €"
+    ws_caja.cell(row=row_idx, column=4, value=mov.note)
+    ws_caja.cell(row=row_idx, column=5, value=mov.fecha)
+    ws_caja.cell(row=row_idx, column=6, value=creator_name)
+    ws_caja.cell(row=row_idx, column=7, value=month_mov)
+
+
+def _count_sheet_data_rows(ws) -> int:
+    """Count non-empty data rows below the header row."""
+    return sum(
+        1
+        for row in ws.iter_rows(min_row=2, min_col=1, max_col=1, values_only=True)
+        if row[0] is not None and str(row[0]).strip() != ""
+    )
+
+
+def _workbook_matches_db(excel_path: Path, expected_tickets: int, expected_movements: int) -> bool:
+    """Check whether existing workbook has required sheets and matches expected synced row counts."""
+    required_sheets = {"Resumen Cuentas", "Resumen Mensual", "Tickets", "Movimientos Caja"}
+    wb = None
+    try:
+        wb = load_workbook(excel_path, read_only=True, data_only=True)
+        if not required_sheets.issubset(wb.sheetnames):
+            return False
+        excel_tickets = _count_sheet_data_rows(wb["Tickets"])
+        excel_movements = _count_sheet_data_rows(wb["Movimientos Caja"])
+        return excel_tickets == expected_tickets and excel_movements == expected_movements
+    except PermissionError:
+        raise
+    except (zipfile.BadZipFile, InvalidFileException, EOFError, KeyError, OSError):
+        return False
+    finally:
+        if wb is not None:
+            wb.close()
+
+
 def append_ticket(excel_path: Path, user_name: str, ticket: Ticket) -> int:
     """Append a single ticket to the Tickets sheet.
 
@@ -196,17 +275,7 @@ def append_ticket(excel_path: Path, user_name: str, ticket: Ticket) -> int:
     ws = wb["Tickets"] if "Tickets" in wb.sheetnames else wb.active
 
     next_row = ws.max_row + 1
-    month_liq = _format_created_month(ticket.created_at)
-
-    ws.cell(row=next_row, column=1, value=user_name)
-    ws.cell(row=next_row, column=2, value=ticket.empresa)
-    ws.cell(row=next_row, column=3, value=ticket.nif)
-    ws.cell(row=next_row, column=4, value=ticket.descripcion)
-    ws.cell(row=next_row, column=5, value=float(ticket.total))
-    ws.cell(row=next_row, column=6, value=ticket.fecha)
-    ws.cell(row=next_row, column=7, value=month_liq)
-
-    ws.cell(row=next_row, column=5).number_format = "#,##0.00 €"
+    _write_ticket_row(ws, next_row, user_name, ticket, excel_path)
 
     # Refresh auto-filter if data present
     if ws.max_row > 1:
@@ -264,7 +333,7 @@ def update_resumen_sheet(ws, balances: list[UserBalance]) -> None:
         if "PAZ" in bal.status_label:
             c_status.fill = FILL_PAZ
             c_status.font = FONT_PAZ
-        elif "DEBE A LA JEFA" in bal.status_label:
+        elif "DEBE A LA EMPRESA" in bal.status_label or "DEBE A LA JEFA" in bal.status_label:
             c_status.fill = FILL_DEBE
             c_status.font = FONT_DEBE
         else:
@@ -325,7 +394,7 @@ def update_mensual_sheet(ws, summaries: list[MonthlyWorkerSummary]) -> None:
 
 
 def sync_pending_tickets(excel_path: Path, repo: Repository) -> tuple[int, bool]:
-    """Synchronize pending tickets, pending cash movements, and refresh summary sheets.
+    """Synchronize pending tickets/movements and auto-rebuild if Excel is out of sync with SQLite.
 
     Args:
         excel_path: Path to the Excel file.
@@ -334,13 +403,32 @@ def sync_pending_tickets(excel_path: Path, repo: Repository) -> tuple[int, bool]
     Returns:
         (synced_items_count, success_flag)
     """
+    total_tickets = repo.count_all_tickets()
+    total_movements = repo.count_all_movements()
     pending_tickets = repo.get_unsynced_tickets()
     pending_movements = repo.get_unsynced_movements()
 
-    if not pending_tickets and not pending_movements:
+    if total_tickets == 0 and total_movements == 0:
         return 0, True
 
     try:
+        if not excel_path.exists():
+            logger.info("Excel file does not exist yet while DB has records; rebuilding full workbook...")
+            return rebuild_excel_from_db(excel_path, repo)
+
+        expected_tickets = max(total_tickets - len(pending_tickets), 0)
+        expected_movements = max(total_movements - len(pending_movements), 0)
+        if not _workbook_matches_db(excel_path, expected_tickets, expected_movements):
+            logger.info(
+                "Detected row mismatch or damaged sheets between SQLite "
+                f"(expected synced: {expected_tickets} tickets, {expected_movements} movements) "
+                "and Excel; triggering automatic full rebuild..."
+            )
+            return rebuild_excel_from_db(excel_path, repo)
+
+        if not pending_tickets and not pending_movements:
+            return 0, True
+
         ensure_workbook(excel_path)
         wb = load_workbook(excel_path)
 
@@ -349,16 +437,7 @@ def sync_pending_tickets(excel_path: Path, repo: Repository) -> tuple[int, bool]
         synced_ticket_ids: list[int] = []
         for ticket, user_name in pending_tickets:
             next_row = ws_tickets.max_row + 1
-            month_liq = _format_created_month(ticket.created_at)
-
-            ws_tickets.cell(row=next_row, column=1, value=user_name)
-            ws_tickets.cell(row=next_row, column=2, value=ticket.empresa)
-            ws_tickets.cell(row=next_row, column=3, value=ticket.nif)
-            ws_tickets.cell(row=next_row, column=4, value=ticket.descripcion)
-            ws_tickets.cell(row=next_row, column=5, value=float(ticket.total))
-            ws_tickets.cell(row=next_row, column=6, value=ticket.fecha)
-            ws_tickets.cell(row=next_row, column=7, value=month_liq)
-            ws_tickets.cell(row=next_row, column=5).number_format = "#,##0.00 €"
+            _write_ticket_row(ws_tickets, next_row, user_name, ticket, excel_path)
             if ticket.id is not None:
                 synced_ticket_ids.append(ticket.id)
 
@@ -370,16 +449,7 @@ def sync_pending_tickets(excel_path: Path, repo: Repository) -> tuple[int, bool]
         synced_movement_ids: list[int] = []
         for mov, worker_name, creator_name in pending_movements:
             next_row = ws_caja.max_row + 1
-            month_mov = _format_created_month(mov.created_at)
-
-            ws_caja.cell(row=next_row, column=1, value=worker_name)
-            ws_caja.cell(row=next_row, column=2, value=mov.movement_type)
-            ws_caja.cell(row=next_row, column=3, value=float(mov.amount))
-            ws_caja.cell(row=next_row, column=4, value=mov.note)
-            ws_caja.cell(row=next_row, column=5, value=mov.fecha)
-            ws_caja.cell(row=next_row, column=6, value=creator_name)
-            ws_caja.cell(row=next_row, column=7, value=month_mov)
-            ws_caja.cell(row=next_row, column=3).number_format = "#,##0.00 €"
+            _write_movement_row(ws_caja, next_row, worker_name, mov, creator_name)
             if mov.id is not None:
                 synced_movement_ids.append(mov.id)
 
@@ -449,15 +519,7 @@ def rebuild_excel_from_db(excel_path: Path, repo: Repository) -> tuple[int, bool
         _setup_sheet_headers(ws_tickets, COLUMNS_TICKETS)
         synced_ticket_ids: list[int] = []
         for idx, (ticket, user_name) in enumerate(all_tickets, start=2):
-            month_liq = _format_created_month(ticket.created_at)
-            ws_tickets.cell(row=idx, column=1, value=user_name)
-            ws_tickets.cell(row=idx, column=2, value=ticket.empresa)
-            ws_tickets.cell(row=idx, column=3, value=ticket.nif)
-            ws_tickets.cell(row=idx, column=4, value=ticket.descripcion)
-            ws_tickets.cell(row=idx, column=5, value=float(ticket.total))
-            ws_tickets.cell(row=idx, column=6, value=ticket.fecha)
-            ws_tickets.cell(row=idx, column=7, value=month_liq)
-            ws_tickets.cell(row=idx, column=5).number_format = "#,##0.00 €"
+            _write_ticket_row(ws_tickets, idx, user_name, ticket, excel_path)
             if ticket.id is not None:
                 synced_ticket_ids.append(ticket.id)
 
@@ -469,15 +531,7 @@ def rebuild_excel_from_db(excel_path: Path, repo: Repository) -> tuple[int, bool
         _setup_sheet_headers(ws_caja, COLUMNS_CAJA)
         synced_movement_ids: list[int] = []
         for idx, (mov, worker_name, creator_name) in enumerate(all_movements, start=2):
-            month_mov = _format_created_month(mov.created_at)
-            ws_caja.cell(row=idx, column=1, value=worker_name)
-            ws_caja.cell(row=idx, column=2, value=mov.movement_type)
-            ws_caja.cell(row=idx, column=3, value=float(mov.amount))
-            ws_caja.cell(row=idx, column=4, value=mov.note)
-            ws_caja.cell(row=idx, column=5, value=mov.fecha)
-            ws_caja.cell(row=idx, column=6, value=creator_name)
-            ws_caja.cell(row=idx, column=7, value=month_mov)
-            ws_caja.cell(row=idx, column=3).number_format = "#,##0.00 €"
+            _write_movement_row(ws_caja, idx, worker_name, mov, creator_name)
             if mov.id is not None:
                 synced_movement_ids.append(mov.id)
 

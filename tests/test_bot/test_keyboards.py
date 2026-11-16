@@ -5,7 +5,7 @@ from __future__ import annotations
 from bot.keyboards import (
     BTN_AYUDA,
     BTN_RESUMEN,
-    BTN_PANEL_JEFA,
+    BTN_PANEL_ADMIN,
     BTN_ASIGNAR_DINERO,
     BTN_DEVOLVER,
     BTN_BOLSILLO,
@@ -46,7 +46,7 @@ class TestKeyboards:
 
         rows = kb.keyboard
         assert len(rows) == 3
-        assert rows[0][0].text == BTN_PANEL_JEFA
+        assert rows[0][0].text == BTN_PANEL_ADMIN
         assert rows[0][1].text == BTN_ASIGNAR_DINERO
         assert rows[1][0].text == BTN_RESUMEN
         assert rows[1][1].text == BTN_DEVOLVER

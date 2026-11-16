@@ -185,9 +185,9 @@ class TestRolesAndAccountingRepo:
         b1 = repo.get_user_balance(worker.id)
         assert b1.total_assigned == 50.0
         assert b1.net_balance == 50.0
-        assert "DEBE A LA JEFA" in b1.status_label
+        assert "DEBE A LA EMPRESA" in b1.status_label
 
-        # Case 3: Worker spends 70€ in tickets -> Jefa owes worker 20€
+        # Case 3: Worker spends 70€ in tickets -> Empresa owes worker 20€
         repo.create_ticket(
             user_id=worker.id, image_path="/t.jpg", empresa="Repsol",
             nif="", descripcion="Gasolina", total=70.0, fecha="01/01/2026",
@@ -195,7 +195,7 @@ class TestRolesAndAccountingRepo:
         b2 = repo.get_user_balance(worker.id)
         assert b2.total_spent == 70.0
         assert b2.net_balance == -20.0  # 50 - 70 = -20
-        assert "LA JEFA LE DEBE" in b2.status_label
+        assert "LA EMPRESA LE DEBE" in b2.status_label
         assert "20.00 €" in b2.status_label
 
         # Case 4: Invalid movement type raises ValueError

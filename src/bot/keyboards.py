@@ -16,7 +16,8 @@ if TYPE_CHECKING:
 # Text constants for button matching
 BTN_RESUMEN = "📊 Mi Cuenta / Saldo"
 BTN_RESUMEN_LEGACY = "📊 Mi Resumen"
-BTN_PANEL_JEFA = "👑 Panel Jefa (Saldos)"
+BTN_PANEL_ADMIN = "👑 Panel Admin"
+BTN_PANEL_JEFA_LEGACY = "👑 Panel Jefa (Saldos)"
 BTN_ASIGNAR_DINERO = "💵 Asignar Dinero"
 BTN_DEVOLVER = "💸 Devolver Sobrante"
 BTN_BOLSILLO = "👛 Puse de mi Bolsillo"
@@ -28,7 +29,8 @@ BTN_SIN_NOTA = "📝 Sin Nota"
 ALL_MENU_BUTTONS = frozenset({
     BTN_RESUMEN,
     BTN_RESUMEN_LEGACY,
-    BTN_PANEL_JEFA,
+    BTN_PANEL_ADMIN,
+    BTN_PANEL_JEFA_LEGACY,
     BTN_ASIGNAR_DINERO,
     BTN_DEVOLVER,
     BTN_BOLSILLO,
@@ -43,7 +45,7 @@ def get_main_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
     if is_admin:
         keyboard = [
             [
-                KeyboardButton(text=BTN_PANEL_JEFA),
+                KeyboardButton(text=BTN_PANEL_ADMIN),
                 KeyboardButton(text=BTN_ASIGNAR_DINERO),
             ],
             [
@@ -261,7 +263,7 @@ def get_worker_actions_keyboard(worker: User, is_env_superadmin: bool = False) -
         if worker.role == "admin":
             rows.append([InlineKeyboardButton(text="👤 Pasar a Trabajador", callback_data=f"wrk_role:{worker.id}:trabajador")])
         else:
-            rows.append([InlineKeyboardButton(text="👑 Hacer Admin / Jefa", callback_data=f"wrk_role:{worker.id}:admin")])
+            rows.append([InlineKeyboardButton(text="👑 Hacer Admin", callback_data=f"wrk_role:{worker.id}:admin")])
 
     rows.append([InlineKeyboardButton(text="❌ Cerrar", callback_data="cancel_action")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

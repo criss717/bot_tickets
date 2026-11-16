@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import re
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from aiogram import Bot, F, Router
@@ -22,7 +26,8 @@ from bot.keyboards import (
     BTN_BOLSILLO,
     BTN_CANCELAR,
     BTN_DEVOLVER,
-    BTN_PANEL_JEFA,
+    BTN_PANEL_ADMIN,
+    BTN_PANEL_JEFA_LEGACY,
     BTN_RESUMEN,
     BTN_RESUMEN_LEGACY,
     BTN_SINCRONIZAR,
@@ -107,6 +112,74 @@ class _PendingDuplicate:
     dhash: str
     created_ts: float
     extracted: ExtractedTicket | None = None
+
+
+def _sanitize_filename_segment(text: str, max_len: int = 24, fallback: str = "ticket") -> str:
+    """Sanitize a string into an ASCII, Windows/SMB-safe filename segment."""
+    if not text:
+        return fallback
+    nfkd = unicodedata.normalize("NFKD", text)
+    ascii_text = "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", ascii_text)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("._-")
+    return cleaned[:max_len] or fallback
+
+
+def _format_photo_date_part(fecha: str) -> str:
+    """Convert DD/MM/YYYY ticket date to YYYY-MM-DD, falling back to today."""
+    raw = (fecha or "").strip()
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", raw)
+    if m:
+        day, month, year = m.groups()
+        return f"{year}-{month}-{day}"
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def build_readable_ticket_image_path(
+    images_dir: Path,
+    worker_name: str,
+    extracted: ExtractedTicket,
+    unique_suffix: str | None = None,
+) -> Path:
+    """Build an organized, Windows/SMB-safe photo path under images_dir/YYYY-MM/."""
+    month_folder = datetime.now().strftime("%Y-%m")
+    date_part = _format_photo_date_part(extracted.fecha)
+    worker_slug = _sanitize_filename_segment(worker_name, max_len=20, fallback="trabajador")
+    empresa_slug = _sanitize_filename_segment(extracted.empresa, max_len=24, fallback="comercio")
+    total_slug = f"{extracted.total:.2f}".replace(".", "-")
+    suffix = _sanitize_filename_segment(unique_suffix or uuid.uuid4().hex[:6], max_len=12, fallback="img")
+
+    filename = f"{date_part}_{worker_slug}_{empresa_slug}_{total_slug}EUR_{suffix}.jpg"
+    target = (images_dir / month_folder / filename).resolve()
+    base_resolved = images_dir.resolve()
+    if not target.is_relative_to(base_resolved):
+        raise ValueError("Invalid target image path outside images_dir")
+    return target
+
+
+def _store_ticket_image(
+    temp_path: Path,
+    images_dir: Path,
+    worker_name: str,
+    extracted: ExtractedTicket,
+) -> Path:
+    """Move processed receipt image into monthly readable export folder with 0644/0755 perms."""
+    target_path = build_readable_ticket_image_path(images_dir, worker_name, extracted)
+    try:
+        os.chmod(images_dir, 0o755)
+    except OSError:
+        pass
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(target_path.parent, 0o755)
+    except OSError:
+        pass
+    os.replace(temp_path, target_path)
+    try:
+        os.chmod(target_path, 0o644)
+    except OSError:
+        pass
+    return target_path
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -230,7 +303,7 @@ def create_router(
             user = repo.get_user_by_telegram_id(message.from_user.id)
             reply_markup = get_user_menu(user, admin_telegram_ids) if user is not None else None
             await message.answer(
-                "⛔ Esta opción es exclusiva para la Jefa / Administradores.",
+                "⛔ Esta opción es exclusiva para Administradores.",
                 reply_markup=reply_markup,
             )
             return None
@@ -240,7 +313,7 @@ def create_router(
         admin_user = _require_admin_sync(callback.from_user.id, repo, admin_telegram_ids)
         if admin_user is None:
             await _clear_state(state)
-            await callback.answer("⛔ Esta opción es exclusiva para la Jefa / Administradores.", show_alert=True)
+            await callback.answer("⛔ Esta opción es exclusiva para Administradores.", show_alert=True)
             return None
         return admin_user
 
@@ -263,10 +336,14 @@ def create_router(
         sha256: str,
         dhash: str,
     ) -> None:
-        """Save extracted ticket to SQLite, sync Excel, and reply with quick edit/delete buttons."""
+        """Save extracted ticket to SQLite, rename photo cleanly, sync Excel, and reply."""
+        final_image_path = image_path
+        if image_path.exists():
+            final_image_path = _store_ticket_image(image_path, images_dir, user.name, extracted)
+
         saved_ticket = repo.create_ticket(
             user_id=user.id,
-            image_path=str(image_path),
+            image_path=str(final_image_path),
             empresa=extracted.empresa,
             nif=extracted.nif,
             descripcion=extracted.descripcion,
@@ -341,7 +418,7 @@ def create_router(
                 repo.set_user_role(existing.id, desired_role)
                 existing.role = desired_role
 
-            role_desc = "Jefa / Admin 👑" if is_admin(existing, admin_telegram_ids) else "Trabajador 👤"
+            role_desc = "Admin 👑" if is_admin(existing, admin_telegram_ids) else "Trabajador 👤"
             await message.answer(
                 f"👋 ¡Hola de nuevo, {existing.name}!\n"
                 f"Rol actual: <b>{role_desc}</b>\n\n"
@@ -395,20 +472,20 @@ def create_router(
 
         if admin_mode:
             text = (
-                "👑 <b>Panel de Control de la Jefa</b>\n\n"
-                "• <b>👑 Panel Jefa (Saldos):</b> Ver balances de todos los trabajadores, descargar Excel, desasignar/anular movimientos o gestionar tickets y usuarios.\n"
+                "👑 <b>Panel de Administración</b>\n\n"
+                "• <b>👑 Panel Admin:</b> Ver balances de todos los trabajadores, descargar Excel, desasignar/anular movimientos o gestionar tickets y usuarios.\n"
                 "• <b>💵 Asignar Dinero:</b> Entregar efectivo con tarjetas rápidas o importe manual.\n"
                 "• <b>📊 Mi Cuenta / Saldo:</b> Ver tu balance individual.\n"
                 "• <b>💸 Devolver Sobrante:</b> Registrar devolución de efectivo.\n"
-                "• <b>🔄 Sincronizar Excel:</b> Volcar datos pendientes al archivo Excel.\n"
+                "• <b>🔄 Sincronizar Excel:</b> Reconstruir el archivo Excel íntegro desde la base de datos.\n"
                 "• 📸 Podés mandarme fotos de tickets en cualquier momento (avisa si alguna foto está repetida)."
             )
         else:
             text = (
                 "👤 <b>Guía del Trabajador</b>\n\n"
                 "• 📸 <b>Enviar Ticket:</b> Mandá una foto clara de cualquier ticket/factura. El Excel se actualiza automáticamente y podrás corregir el total o anularlo justo debajo si hizo falta.\n"
-                "• <b>📊 Mi Cuenta / Saldo:</b> Consultá cuánto dinero te asignó la jefa, cuánto gastaste y tu saldo.\n"
-                "• <b>💸 Devolver Sobrante:</b> Registrá cuando devuelvas efectivo a la jefa.\n"
+                "• <b>📊 Mi Cuenta / Saldo:</b> Consultá cuánto dinero te asignó la empresa, cuánto gastaste y tu saldo.\n"
+                "• <b>💸 Devolver Sobrante:</b> Registrá cuando devuelvas efectivo a caja.\n"
                 "• <b>👛 Puse de mi Bolsillo:</b> Dejá constancia si pusiste dinero propio hoy."
             )
 
@@ -419,13 +496,13 @@ def create_router(
     @router.message(StateFilter("*"), Command("sincronizar", "sync"))
     @router.message(StateFilter("*"), F.text == BTN_SINCRONIZAR)
     async def handle_sync(message: Message, state: FSMContext | None = None) -> None:
-        """Handle /sincronizar command or button — manually trigger Excel sync (Admin only)."""
+        """Handle /sincronizar command or button — full rebuild of Excel from SQLite (Admin only)."""
         admin_user = await _require_admin_msg(message, state)
         if admin_user is None:
             return
         await _clear_state(state)
 
-        synced_count, sync_ok = sync_pending_tickets(excel_path, repo)
+        synced_count, sync_ok = rebuild_excel_from_db(excel_path, repo)
         if not sync_ok:
             await message.answer(
                 "⚠️ El archivo Excel sigue abierto o bloqueado en el equipo.\n\n"
@@ -436,13 +513,13 @@ def create_router(
 
         if synced_count > 0:
             await message.answer(
-                f"✅ ¡Sincronización exitosa!\n"
-                f"Se volcaron {synced_count} registro(s) pendiente(s) al archivo Excel.",
+                f"✅ ¡Sincronización completa!\n"
+                f"Se reconstruyó el libro Excel completo desde la base de datos ({synced_count} registro(s)).",
                 reply_markup=get_user_menu(admin_user, admin_telegram_ids),
             )
         else:
             await message.answer(
-                "✅ El archivo Excel ya está completamente al día.",
+                "✅ El archivo Excel ya está al día (sin registros en la base de datos).",
                 reply_markup=get_user_menu(admin_user, admin_telegram_ids),
             )
 
@@ -544,11 +621,11 @@ def create_router(
             lines.append("🟢 <i>Estás al día. A paz y salvo con la empresa.</i>")
         elif bal.net_balance > 0:
             lines.append(
-                f"🟡 <i>Tenés <b>{bal.net_balance:.2f} €</b> de la Jefa pendientes de justificar con tickets o devolver.</i>"
+                f"🟡 <i>Tenés <b>{bal.net_balance:.2f} €</b> de la empresa pendientes de justificar con tickets o devolver.</i>"
             )
         else:
             lines.append(
-                f"🔴 <i>La Jefa te debe reembolsar <b>{abs(bal.net_balance):.2f} €</b> de tickets pagados con tu dinero.</i>"
+                f"🔴 <i>La empresa te debe reembolsar <b>{abs(bal.net_balance):.2f} €</b> de tickets pagados con tu dinero.</i>"
             )
 
         if tickets:
@@ -558,12 +635,12 @@ def create_router(
 
         await message.answer("\n".join(lines), reply_markup=get_user_menu(user, admin_telegram_ids))
 
-    # ── Panel Jefa (Admin Only) ───────────────────────────────────────────
+    # ── Panel Admin (Admin Only) ──────────────────────────────────────────
 
     @router.message(StateFilter("*"), Command("panel"))
-    @router.message(StateFilter("*"), F.text == BTN_PANEL_JEFA)
+    @router.message(StateFilter("*"), F.text.in_({BTN_PANEL_ADMIN, BTN_PANEL_JEFA_LEGACY}))
     async def handle_boss_panel(message: Message, state: FSMContext | None = None) -> None:
-        """Show boss control panel with balances and quick management actions."""
+        """Show admin control panel with balances and quick management actions."""
         admin_user = await _require_admin_msg(message, state)
         if admin_user is None:
             return
@@ -576,7 +653,7 @@ def create_router(
 
         month_label = balances[0].month_label if balances else ""
         lines = [
-            f"👑 <b>Panel de Control de la Jefa ({month_label})</b>",
+            f"👑 <b>Panel Admin ({month_label})</b>",
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         ]
 
@@ -783,7 +860,7 @@ def create_router(
         worker = repo.get_user_by_id(worker_id)
         if worker and worker.telegram_id > 0:
             notify_text = (
-                f"💵 <b>La Jefa te ha entregado {amount:.2f} € en efectivo</b>\n"
+                f"💵 <b>Administración te ha entregado {amount:.2f} € en efectivo</b>\n"
                 f"📝 Motivo: {note or 'Fondo de caja'}\n\n"
                 "Podés ver tu saldo actualizado pulsando <b>📊 Mi Cuenta / Saldo</b>."
             )
@@ -934,7 +1011,7 @@ def create_router(
             await notify_worker(
                 bot,
                 worker.telegram_id,
-                f"↩️ <b>La Jefa ha desasignado / ajustado {amount:.2f} € de tu cuenta</b>\n"
+                f"↩️ <b>Administración ha desasignado / ajustado {amount:.2f} € de tu cuenta</b>\n"
                 f"📝 Motivo: {note or 'Ajuste de asignación'}\n"
                 f"📊 Tu nuevo estado: {bal.status_label}",
             )
@@ -991,7 +1068,7 @@ def create_router(
             await notify_worker(
                 bot,
                 worker.telegram_id,
-                f"ℹ️ <b>La Jefa anuló un movimiento erróneo ({mov.movement_type}: {mov.amount:.2f} €)</b>\n"
+                f"ℹ️ <b>Administración anuló un movimiento erróneo ({mov.movement_type}: {mov.amount:.2f} €)</b>\n"
                 f"📊 Tu estado actualizado: {bal.status_label}",
             )
         await callback.answer("Movimiento anulado")
@@ -1014,7 +1091,7 @@ def create_router(
 
         extra = (f"💸 Devolver todo ({bal.net_balance:.2f} €)", f"ret_amt:{bal.net_balance:.2f}") if bal.net_balance > 0 else None
         await message.answer(
-            f"💸 <b>Devolver Sobrante a la Jefa</b>\n"
+            f"💸 <b>Devolver Sobrante a Caja / Empresa</b>\n"
             f"Tu saldo pendiente actual: <b>{bal.net_balance:.2f} €</b>\n\n"
             "Tocá un importe rápido o escribí cuánto vas a devolver en euros:",
             reply_markup=get_amount_inline_keyboard("ret_amt", amounts=(20, 50, 100), extra_top_button=extra),
@@ -1113,7 +1190,7 @@ def create_router(
             "👛 <b>Puse de mi Bolsillo</b>\n\n"
             "¿Cuánto dinero propio pusiste o disponés hoy para gastos?\n"
             "<i>(Tocá un importe o escribí el monto en euros)</i>\n\n"
-            "💡 <i>Nota: La deuda que la Jefa debe reembolsarte se calcula con las facturas reales (tickets) que subas al bot.</i>",
+            "💡 <i>Nota: El importe a reembolsarte por la empresa se calcula con las facturas reales (tickets) que subas al bot.</i>",
             reply_markup=get_amount_inline_keyboard("pocket_amt", amounts=(20, 50, 100)),
         )
 
@@ -1378,7 +1455,7 @@ def create_router(
             await callback.answer("Trabajador no encontrado.", show_alert=True)
             return
         is_env_super = worker.telegram_id in admin_telegram_ids
-        role_label = "Jefa / Admin 👑" if worker.role == "admin" else "Trabajador 👤"
+        role_label = "Admin 👑" if worker.role == "admin" else "Trabajador 👤"
         await callback.message.edit_text(
             f"👤 <b>{worker.name}</b>\n"
             f"Rol: <b>{role_label}</b>\n"
@@ -1575,10 +1652,18 @@ def create_router(
             return
 
         raw_bytes = image_bytes.read()
-        image_name = f"{uuid.uuid4().hex}.jpg"
+        image_name = f".tmp_{uuid.uuid4().hex}.jpg"
         image_path = images_dir / image_name
         image_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(image_path.parent, 0o755)
+        except OSError:
+            pass
         image_path.write_bytes(raw_bytes)
+        try:
+            os.chmod(image_path, 0o644)
+        except OSError:
+            pass
 
         try:
             resized = resize_if_large(raw_bytes, max_width=1024)
@@ -1707,7 +1792,7 @@ def create_router(
         new_user = repo.create_user(telegram_id=telegram_id, name=name, role=role)
 
         role_msg = (
-            "👑 Has sido registrado como <b>Jefa / Administrador</b>."
+            "👑 Has sido registrado como <b>Administrador</b>."
             if role == "admin"
             else "👤 Has sido registrado como <b>Trabajador</b>."
         )

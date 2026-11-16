@@ -33,15 +33,15 @@ async def setup_bot_commands(
     """Register role-tailored commands in Telegram's native menu button."""
     worker_commands = [
         BotCommand(command="resumen", description="📊 Ver mi cuenta y saldo neto"),
-        BotCommand(command="devolver", description="💸 Devolver sobrante a la jefa"),
+        BotCommand(command="devolver", description="💸 Devolver sobrante a la empresa"),
         BotCommand(command="ayuda", description="❓ Ayuda e instrucciones de uso"),
         BotCommand(command="cancelar", description="❌ Cancelar acción en curso"),
     ]
     admin_commands = [
-        BotCommand(command="panel", description="👑 Panel Jefa: saldos de trabajadores"),
+        BotCommand(command="panel", description="👑 Panel Admin: saldos de trabajadores"),
         BotCommand(command="asignar", description="💵 Asignar dinero a un trabajador"),
         BotCommand(command="resumen", description="📊 Ver mi cuenta y saldo neto"),
-        BotCommand(command="devolver", description="💸 Devolver sobrante a la jefa"),
+        BotCommand(command="devolver", description="💸 Devolver sobrante a la empresa"),
         BotCommand(command="sincronizar", description="🔄 Forzar sincronización con Excel"),
         BotCommand(command="excel", description="📥 Descargar archivo Excel actual"),
         BotCommand(command="ayuda", description="❓ Ayuda e instrucciones de uso"),

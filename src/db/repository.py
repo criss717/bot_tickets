@@ -481,6 +481,16 @@ class Repository:
             ).fetchall()
             return [(self._row_to_ticket(row), row["user_name"]) for row in rows]
 
+    def count_all_tickets(self) -> int:
+        """Count all tickets belonging to valid users (matches get_all_tickets_with_users)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) as cnt
+                   FROM tickets t
+                   JOIN users u ON t.user_id = u.id"""
+            ).fetchone()
+            return int(row["cnt"])
+
     def mark_tickets_synced(self, ticket_ids: list[int]) -> None:
         """Mark a list of tickets as synchronized to Excel."""
         if not ticket_ids:
@@ -576,6 +586,17 @@ class Repository:
                    ORDER BY m.id ASC""",
             ).fetchall()
             return [(self._row_to_movement(row), row["worker_name"], row["creator_name"]) for row in rows]
+
+    def count_all_movements(self) -> int:
+        """Count all cash movements belonging to valid users (matches get_all_movements_with_users)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) as cnt
+                   FROM cash_movements m
+                   JOIN users u ON m.user_id = u.id
+                   JOIN users c ON m.created_by_id = c.id"""
+            ).fetchone()
+            return int(row["cnt"])
 
     def get_recent_movements(
         self,
@@ -735,9 +756,9 @@ class Repository:
         if abs(net_balance) < 0.01:
             status_label = "🟢 A PAZ Y SALVO (0.00 €)"
         elif net_balance > 0.00:
-            status_label = f"🟡 DEBE A LA JEFA ({net_balance:.2f} €)"
+            status_label = f"🟡 DEBE A LA EMPRESA ({net_balance:.2f} €)"
         else:
-            status_label = f"🔴 LA JEFA LE DEBE ({abs(net_balance):.2f} €)"
+            status_label = f"🔴 LA EMPRESA LE DEBE ({abs(net_balance):.2f} €)"
 
         return UserBalance(
             user_id=user.id or user_id,

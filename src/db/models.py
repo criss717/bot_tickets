@@ -83,7 +83,7 @@ class UserBalance:
     total_returned: float   # Acumulado histórico total
     total_own_pocket: float # Total fondos propios declarados
     net_balance: float      # Saldo neto vivo (NUNCA se reinicia)
-    status_label: str       # 🟢 A PAZ Y SALVO, 🟡 DEBE A LA JEFA, 🔴 LA JEFA LE DEBE
+    status_label: str       # 🟢 A PAZ Y SALVO, 🟡 DEBE A LA EMPRESA, 🔴 LA EMPRESA LE DEBE
 
 
 @dataclass

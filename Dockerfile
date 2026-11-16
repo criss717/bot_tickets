@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source code and prepare persistent mount directories owned by appuser
 COPY --chown=appuser:appgroup src/ ./src/
-RUN mkdir -p /app/data/images /app/export && chown -R appuser:appgroup /app
+RUN mkdir -p /app/data/images /app/export/fotos && chown -R appuser:appgroup /app
 
 USER appuser
 

@@ -344,7 +344,7 @@ class TestCallbackQuerySync:
         msg.from_user = TgUser(id=111, is_bot=False, first_name="Pepe")
         msg.answer = AsyncMock()
         await sync_msg_handler(msg)
-        assert "exclusiva para la Jefa" in msg.answer.call_args[0][0]
+        assert "exclusiva para Administradores" in msg.answer.call_args[0][0]
 
         sync_cb_handler = next(
             h.callback
@@ -357,7 +357,43 @@ class TestCallbackQuerySync:
         cb.from_user = TgUser(id=111, is_bot=False, first_name="Pepe")
         cb.answer = AsyncMock()
         await sync_cb_handler(cb)
-        assert "exclusiva para la Jefa" in cb.answer.call_args[0][0]
+        assert "exclusiva para Administradores" in cb.answer.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_admin_sync_command_rebuilds_incomplete_excel(self, repo: Repository, tmp_path: Path):
+        from openpyxl import load_workbook
+
+        repo.create_user(telegram_id=999, name="Admin", role="admin")
+        worker = repo.create_user(telegram_id=101, name="Pepe", role="trabajador")
+        repo.create_ticket(
+            user_id=worker.id, image_path="", empresa="Historico SL",
+            nif="", descripcion="Menu", total=18.5, fecha="10/11/2026", synced_to_excel=True,
+        )
+
+        excel_path = tmp_path / "export" / "tickets.xlsx"
+        from excel.writer import ensure_workbook
+        ensure_workbook(excel_path)
+        assert load_workbook(excel_path)["Tickets"].max_row == 1
+
+        mock_bot = MagicMock(spec=Bot)
+        mock_extractor = MagicMock(spec=VisionExtractor)
+        router = create_router(
+            repo, mock_extractor, mock_bot, tmp_path / "export" / "fotos", excel_path, admin_telegram_ids=(999,)
+        )
+
+        sync_msg_handler = next(
+            h.callback
+            for obs in router.observers.values()
+            for h in obs.handlers
+            if "handle_sync" in getattr(h.callback, "__name__", "")
+        )
+        msg = MagicMock(spec=Message)
+        msg.from_user = TgUser(id=999, is_bot=False, first_name="Admin")
+        msg.answer = AsyncMock()
+        await sync_msg_handler(msg)
+
+        assert "Sincronización completa" in msg.answer.call_args[0][0]
+        assert load_workbook(excel_path)["Tickets"].max_row == 2
 
 
 class TestRBACAndAccountingHandlers:
@@ -382,7 +418,7 @@ class TestRBACAndAccountingHandlers:
         msg.from_user = TgUser(id=888, is_bot=False, first_name="Ex Admin")
         msg.answer = AsyncMock()
         await panel_handler(msg)
-        assert "exclusiva para la Jefa" in msg.answer.call_args[0][0]
+        assert "exclusiva para Administradores" in msg.answer.call_args[0][0]
         kb = msg.answer.call_args.kwargs.get("reply_markup")
         assert kb is not None
         assert len(kb.keyboard) == 2  # Worker 2x2 keyboard (no admin buttons, no sync)
@@ -423,11 +459,11 @@ class TestRBACAndAccountingHandlers:
 
         await panel_handler(msg)
         assert msg.answer.called
-        assert "exclusiva para la Jefa" in msg.answer.call_args[0][0]
+        assert "exclusiva para Administradores" in msg.answer.call_args[0][0]
 
     @pytest.mark.asyncio
     async def test_admin_can_access_boss_panel(self, repo: Repository, tmp_path: Path):
-        admin = repo.create_user(telegram_id=999, name="La Jefa", role="admin")
+        admin = repo.create_user(telegram_id=999, name="Admin Principal", role="admin")
         worker = repo.create_user(telegram_id=111, name="Trabajador 1", role="trabajador")
         mock_bot = MagicMock(spec=Bot)
         mock_extractor = MagicMock(spec=VisionExtractor)
@@ -442,13 +478,13 @@ class TestRBACAndAccountingHandlers:
         assert panel_handler is not None
 
         msg = MagicMock(spec=Message)
-        msg.from_user = TgUser(id=999, is_bot=False, first_name="La Jefa")
+        msg.from_user = TgUser(id=999, is_bot=False, first_name="Admin Principal")
         msg.answer = AsyncMock()
 
         await panel_handler(msg)
         assert msg.answer.called
         text = msg.answer.call_args[0][0]
-        assert "Panel de Control de la Jefa" in text
+        assert "Panel Admin" in text
         assert "Trabajador 1" in text
 
     @pytest.mark.asyncio
@@ -735,6 +771,58 @@ class TestDeduplicationTicketCorrectionAndExcelDownload:
         assert repo.get_ticket_by_id(tkt.id) is None
         assert not img_file.exists()
         assert repo.get_user_balance(worker.id).net_balance == 0.0
+
+    @pytest.mark.asyncio
+    async def test_photo_saved_with_readable_windows_safe_name_under_export_and_linked_in_excel(
+        self, repo: Repository, tmp_path: Path
+    ):
+        from datetime import datetime
+        from openpyxl import load_workbook
+
+        worker = repo.create_user(telegram_id=101, name="José Ángel / López", role="trabajador")
+        export_dir = tmp_path / "export"
+        fotos_dir = export_dir / "fotos"
+        excel_path = export_dir / "tickets.xlsx"
+
+        mock_bot = MagicMock(spec=Bot)
+        mock_bot.get_file = AsyncMock(return_value=MagicMock(file_path="p.jpg"))
+        jpeg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xbf\x00\xff\xd9"
+        mock_bot.download_file = AsyncMock(return_value=io.BytesIO(jpeg_bytes))
+
+        mock_extractor = MagicMock(spec=VisionExtractor)
+        mock_extractor.extract_from_image = AsyncMock(
+            return_value=ExtractedTicket(
+                empresa='Bar "El Rincón" S.L.', nif="B12345678",
+                descripcion="Desayuno", total=12.40, fecha="16/11/2026",
+            )
+        )
+
+        router = create_router(repo, mock_extractor, mock_bot, fotos_dir, excel_path, (999,))
+        photo_handler = next(
+            h.callback for obs in router.observers.values() for h in obs.handlers
+            if "handle_photo" in getattr(h.callback, "__name__", "")
+        )
+        msg = MagicMock(spec=Message)
+        msg.from_user = TgUser(id=101, is_bot=False, first_name="José")
+        msg.photo = [PhotoSize(file_id="f1", file_unique_id="u1", width=10, height=10)]
+        msg.answer = AsyncMock()
+        await photo_handler(msg)
+
+        tickets = repo.get_tickets_by_user(worker.id)
+        assert len(tickets) == 1
+        saved_path = Path(tickets[0].image_path)
+        assert saved_path.exists()
+        month_str = datetime.now().strftime("%Y-%m")
+        assert saved_path.parent == fotos_dir / month_str
+        assert saved_path.name.startswith("2026-11-16_Jose_Angel_Lopez_Bar_El_Rincon_S_L_12-40EUR_")
+        assert saved_path.suffix == ".jpg"
+        assert list(fotos_dir.glob(".tmp_*")) == []
+
+        wb = load_workbook(excel_path)
+        ws = wb["Tickets"]
+        foto_cell = ws.cell(row=2, column=8)
+        assert foto_cell.value == f"fotos/{month_str}/{saved_path.name}"
+        assert foto_cell.hyperlink.target == f"fotos/{month_str}/{saved_path.name}"
 
 
 @pytest.fixture

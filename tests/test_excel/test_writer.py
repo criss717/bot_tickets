@@ -270,12 +270,12 @@ class TestMultiSheetAccounting:
 
         # Verify Debe cell styles (yellow)
         cell_debe = ws_resumen.cell(row=row_debe, column=8)
-        assert "DEBE A LA JEFA" in str(cell_debe.value)
+        assert "DEBE A LA EMPRESA" in str(cell_debe.value)
         assert cell_debe.fill.start_color.rgb == "00FFEB9C" or cell_debe.fill.fill_type == "solid"
 
         # Verify Acreedor cell styles (red)
         cell_acreedor = ws_resumen.cell(row=row_acreedor, column=8)
-        assert "LA JEFA LE DEBE" in str(cell_acreedor.value)
+        assert "LA EMPRESA LE DEBE" in str(cell_acreedor.value)
         assert cell_acreedor.fill.start_color.rgb == "00FFC7CE" or cell_acreedor.fill.fill_type == "solid"
 
         # Verify number formats
@@ -302,5 +302,83 @@ class TestMultiSheetAccounting:
                 break
         # Ensure atomic save left zero leftover temp files
         assert [p for p in excel_path.parent.glob(".tmp_*")] == []
+
+    def test_sync_auto_rebuilds_when_db_migrated_with_synced_flags_and_missing_excel(
+        self, excel_path: Path, repo: Repository
+    ):
+        worker = repo.create_user(telegram_id=101, name="Pepe", role="trabajador")
+        repo.create_ticket(
+            user_id=worker.id,
+            image_path="/img/old1.jpg",
+            empresa="Restaurante Viejo SL",
+            nif="B11111111",
+            descripcion="Comida",
+            total=25.0,
+            fecha="10/11/2026",
+            synced_to_excel=True,
+        )
+        repo.create_ticket(
+            user_id=worker.id,
+            image_path="/img/old2.jpg",
+            empresa="Gasolinera Antigua",
+            nif="",
+            descripcion="Gasoil",
+            total=45.0,
+            fecha="11/11/2026",
+            synced_to_excel=True,
+        )
+
+        # Simulate brand-new server where export/tickets.xlsx does not exist yet
+        assert not excel_path.exists()
+        synced, ok = sync_pending_tickets(excel_path, repo)
+        assert ok is True
+        assert synced == 2
+
+        wb = load_workbook(excel_path)
+        assert wb["Tickets"].max_row == 3  # Header + 2 historical tickets
+
+    def test_sync_auto_rebuilds_when_excel_missing_historical_rows(
+        self, tmp_path: Path, repo: Repository
+    ):
+        export_dir = tmp_path / "export"
+        excel_path = export_dir / "tickets.xlsx"
+        photo_path = export_dir / "fotos" / "2026-11" / "2026-11-16_Pepe_Tienda_30-00EUR_abc123.jpg"
+        photo_path.parent.mkdir(parents=True, exist_ok=True)
+        photo_path.write_bytes(b"img")
+
+        admin = repo.create_user(telegram_id=999, name="Admin", role="admin")
+        worker = repo.create_user(telegram_id=101, name="Pepe", role="trabajador")
+        # 2 historical tickets already marked synced=1 on old PC
+        repo.create_ticket(
+            user_id=worker.id, image_path=str(photo_path), empresa="Tienda",
+            nif="", descripcion="Material", total=30.0, fecha="16/11/2026", synced_to_excel=True,
+        )
+        repo.create_ticket(
+            user_id=worker.id, image_path="", empresa="Peaje",
+            nif="", descripcion="Autopista", total=10.0, fecha="15/11/2026", synced_to_excel=True,
+        )
+        m1 = repo.create_cash_movement(
+            user_id=worker.id, created_by_id=admin.id,
+            movement_type="ASIGNACION", amount=100.0, note="Fondo",
+        )
+        repo.mark_movements_synced([m1.id])
+
+        # Create an empty Excel workbook (simulating server startup ensure_workbook before fix)
+        ensure_workbook(excel_path)
+        assert load_workbook(excel_path)["Tickets"].max_row == 1
+
+        synced, ok = sync_pending_tickets(excel_path, repo)
+        assert ok is True
+        assert synced == 3  # 2 tickets + 1 movement recovered
+
+        wb = load_workbook(excel_path)
+        ws_tickets = wb["Tickets"]
+        assert ws_tickets.max_row == 3
+        assert wb["Movimientos Caja"].max_row == 2
+        # Verify column 8 (Foto) contains relative link inside export/
+        foto_cell = ws_tickets.cell(row=2, column=8)
+        assert foto_cell.value == "fotos/2026-11/2026-11-16_Pepe_Tienda_30-00EUR_abc123.jpg"
+        assert foto_cell.hyperlink is not None
+        assert foto_cell.hyperlink.target == "fotos/2026-11/2026-11-16_Pepe_Tienda_30-00EUR_abc123.jpg"
 
 
