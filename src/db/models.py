@@ -14,6 +14,7 @@ class User:
     telegram_id: int
     name: str
     role: str = "trabajador"  # 'admin' or 'trabajador'
+    admin_source: str = ""    # '', 'env', or 'bot'
     created_at: datetime | None = None
     id: Optional[int] = None
 

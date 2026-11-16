@@ -9,8 +9,8 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 
+from bot.commands import setup_bot_commands
 from config import load_settings
 from db.repository import Repository
 from ocr.extractor import VisionExtractor
@@ -23,51 +23,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
-
-
-async def setup_bot_commands(
-    bot: Bot,
-    repo: Repository | None = None,
-    admin_telegram_ids: tuple[int, ...] = (),
-) -> None:
-    """Register role-tailored commands in Telegram's native menu button."""
-    worker_commands = [
-        BotCommand(command="resumen", description="📊 Ver mi cuenta y saldo neto"),
-        BotCommand(command="devolver", description="💸 Devolver sobrante a la empresa"),
-        BotCommand(command="ayuda", description="❓ Ayuda e instrucciones de uso"),
-        BotCommand(command="cancelar", description="❌ Cancelar acción en curso"),
-    ]
-    admin_commands = [
-        BotCommand(command="panel", description="👑 Panel Admin: saldos de trabajadores"),
-        BotCommand(command="asignar", description="💵 Asignar dinero a un trabajador"),
-        BotCommand(command="resumen", description="📊 Ver mi cuenta y saldo neto"),
-        BotCommand(command="devolver", description="💸 Devolver sobrante a la empresa"),
-        BotCommand(command="sincronizar", description="🔄 Forzar sincronización con Excel"),
-        BotCommand(command="excel", description="📥 Descargar archivo Excel actual"),
-        BotCommand(command="ayuda", description="❓ Ayuda e instrucciones de uso"),
-        BotCommand(command="cancelar", description="❌ Cancelar acción en curso"),
-    ]
-    admin_set = {tid for tid in admin_telegram_ids if tid > 0}
-    try:
-        await bot.set_my_commands(worker_commands, scope=BotCommandScopeDefault())
-        for admin_tid in admin_set:
-            try:
-                await bot.set_my_commands(
-                    admin_commands,
-                    scope=BotCommandScopeChat(chat_id=admin_tid),
-                )
-            except Exception as e:
-                logger.warning(f"Could not set admin Telegram commands for {admin_tid}: {e}")
-        if repo is not None:
-            for u in repo.get_all_users():
-                if u.telegram_id > 0 and u.telegram_id not in admin_set:
-                    try:
-                        await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=u.telegram_id))
-                    except Exception:
-                        pass
-        logger.info("Telegram native command menu configured successfully.")
-    except Exception as e:
-        logger.warning(f"Could not set native Telegram commands: {e}")
 
 
 async def main() -> None:

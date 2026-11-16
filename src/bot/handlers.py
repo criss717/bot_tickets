@@ -19,6 +19,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
+from bot.commands import sync_user_chat_commands
 from bot.keyboards import (
     ALL_MENU_BUTTONS,
     BTN_ASIGNAR_DINERO,
@@ -185,11 +186,13 @@ def _store_ticket_image(
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 def is_admin(user: User | None, admin_telegram_ids: tuple[int, ...] = ()) -> bool:
-    """Check if user has admin privileges."""
+    """Check if user has admin privileges (from .env superadmin list or bot-promoted admin)."""
     if user is None:
         return False
+    if user.telegram_id in admin_telegram_ids:
+        return True
     if admin_telegram_ids:
-        return user.telegram_id in admin_telegram_ids
+        return user.role == "admin" and user.admin_source == "bot"
     return user.role == "admin"
 
 
@@ -261,15 +264,16 @@ def _require_admin_sync(
     repo: Repository,
     admin_telegram_ids: tuple[int, ...],
 ) -> User | None:
-    """Return User if admin, else None (auto-demoting stale DB admin rows when env list exists)."""
+    """Return User if admin, else None (auto-demoting stale .env/legacy admin rows)."""
     user = repo.get_user_by_telegram_id(telegram_id)
     if user is None:
         return None
     if is_admin(user, admin_telegram_ids):
         return user
-    if admin_telegram_ids and user.role == "admin" and user.id is not None:
-        repo.set_user_role(user.id, "trabajador")
+    if admin_telegram_ids and user.role == "admin" and user.admin_source != "bot" and user.id is not None:
+        repo.set_user_role(user.id, "trabajador", admin_source="")
         user.role = "trabajador"
+        user.admin_source = ""
     return None
 
 
@@ -413,12 +417,19 @@ def create_router(
         existing = repo.get_user_by_telegram_id(telegram_id)
 
         if existing:
-            desired_role = "admin" if telegram_id in admin_telegram_ids else "trabajador"
-            if existing.role != desired_role and existing.id is not None:
-                repo.set_user_role(existing.id, desired_role)
-                existing.role = desired_role
+            if telegram_id in admin_telegram_ids:
+                if (existing.role != "admin" or existing.admin_source != "env") and existing.id is not None:
+                    repo.set_user_role(existing.id, "admin", admin_source="env")
+                    existing.role = "admin"
+                    existing.admin_source = "env"
+            elif existing.role == "admin" and existing.admin_source != "bot" and existing.id is not None:
+                repo.set_user_role(existing.id, "trabajador", admin_source="")
+                existing.role = "trabajador"
+                existing.admin_source = ""
 
-            role_desc = "Admin 👑" if is_admin(existing, admin_telegram_ids) else "Trabajador 👤"
+            user_is_admin = is_admin(existing, admin_telegram_ids)
+            await sync_user_chat_commands(bot, telegram_id, is_admin=user_is_admin)
+            role_desc = "Admin 👑" if user_is_admin else "Trabajador 👤"
             await message.answer(
                 f"👋 ¡Hola de nuevo, {existing.name}!\n"
                 f"Rol actual: <b>{role_desc}</b>\n\n"
@@ -1536,10 +1547,32 @@ def create_router(
         if worker.telegram_id in admin_telegram_ids and new_role != "admin":
             await callback.answer("No podés quitar el rol admin a un administrador definido en .env.", show_alert=True)
             return
-        repo.set_user_role(worker.id, new_role)
+
+        promoted = new_role == "admin"
+        repo.set_user_role(worker.id, new_role, admin_source="bot" if promoted else "")
         rebuild_excel_from_db(excel_path, repo)
+
+        if worker.telegram_id > 0:
+            await sync_user_chat_commands(bot, worker.telegram_id, is_admin=promoted)
+            notify_msg = (
+                "👑 <b>¡Has sido ascendido a Administrador!</b>\n\n"
+                "Ya tenés activado <b>👑 Panel Admin</b>, asignación de caja y descarga de Excel en tu menú inferior."
+                if promoted
+                else "ℹ️ <b>Tu rol ha cambiado a Trabajador 👤</b>\n\n"
+                "Tu menú inferior se actualizó a las opciones de trabajador."
+            )
+            try:
+                await bot.send_message(
+                    chat_id=worker.telegram_id,
+                    text=notify_msg,
+                    reply_markup=get_main_keyboard(is_admin=promoted),
+                )
+            except Exception as e:
+                logger.warning(f"Could not push keyboard update to {worker.telegram_id}: {e}")
+
         await callback.message.edit_text(
-            f"✅ Rol de <b>{worker.name}</b> cambiado a <b>{new_role.upper()}</b>."
+            f"✅ Rol de <b>{worker.name}</b> cambiado a <b>{new_role.upper()}</b>.\n"
+            "<i>Su menú y Excel se actualizaron automáticamente.</i>"
         )
         await callback.answer("Rol actualizado")
 
@@ -1788,8 +1821,15 @@ def create_router(
             )
             return
 
-        role = "admin" if telegram_id in admin_telegram_ids else "trabajador"
-        new_user = repo.create_user(telegram_id=telegram_id, name=name, role=role)
+        is_env_admin = telegram_id in admin_telegram_ids
+        role = "admin" if is_env_admin else "trabajador"
+        new_user = repo.create_user(
+            telegram_id=telegram_id,
+            name=name,
+            role=role,
+            admin_source="env" if is_env_admin else "",
+        )
+        await sync_user_chat_commands(bot, telegram_id, is_admin=is_env_admin)
 
         role_msg = (
             "👑 Has sido registrado como <b>Administrador</b>."

@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS users (
     telegram_id INTEGER UNIQUE NOT NULL,
     name TEXT NOT NULL,
     role TEXT DEFAULT 'trabajador',
+    admin_source TEXT DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -97,14 +98,29 @@ class Repository:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_fecha_total ON tickets(fecha, total)")
 
-            # Safe migration for existing users table: role
+            # Safe migration for existing users table: role & admin_source
             cursor = conn.execute("PRAGMA table_info(users)")
             existing_user_columns = {row["name"] for row in cursor.fetchall()}
             if "role" not in existing_user_columns:
                 conn.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'trabajador'")
+            if "admin_source" not in existing_user_columns:
+                conn.execute("ALTER TABLE users ADD COLUMN admin_source TEXT DEFAULT ''")
 
             # Safe migration for cash_movements indexes
             conn.execute("CREATE INDEX IF NOT EXISTS idx_movements_synced ON cash_movements(synced_to_excel)")
+
+    @staticmethod
+    def _row_to_user(row: sqlite3.Row) -> User:
+        """Convert a SQLite row from `users` into a User dataclass."""
+        keys = row.keys()
+        return User(
+            id=row["id"],
+            telegram_id=row["telegram_id"],
+            name=row["name"],
+            role=row["role"] if "role" in keys and row["role"] else "trabajador",
+            admin_source=row["admin_source"] if "admin_source" in keys and row["admin_source"] else "",
+            created_at=row["created_at"],
+        )
 
     @staticmethod
     def _row_to_ticket(row: sqlite3.Row) -> Ticket:
@@ -143,18 +159,26 @@ class Repository:
 
     # ── Users ─────────────────────────────────────────────────────────────
 
-    def create_user(self, telegram_id: int, name: str, role: str = "trabajador") -> User:
+    def create_user(
+        self,
+        telegram_id: int,
+        name: str,
+        role: str = "trabajador",
+        admin_source: str = "",
+    ) -> User:
         """Create a new user. Raises if telegram_id already exists."""
+        clean_source = admin_source if role == "admin" else ""
         with self._connect() as conn:
             cursor = conn.execute(
-                "INSERT INTO users (telegram_id, name, role) VALUES (?, ?, ?)",
-                (telegram_id, name, role),
+                "INSERT INTO users (telegram_id, name, role, admin_source) VALUES (?, ?, ?, ?)",
+                (telegram_id, name, role, clean_source),
             )
             return User(
                 id=cursor.lastrowid,
                 telegram_id=telegram_id,
                 name=name,
                 role=role,
+                admin_source=clean_source,
             )
 
     def get_user_by_telegram_id(self, telegram_id: int) -> User | None:
@@ -164,15 +188,7 @@ class Repository:
                 "SELECT * FROM users WHERE telegram_id = ?",
                 (telegram_id,),
             ).fetchone()
-            if row is None:
-                return None
-            return User(
-                id=row["id"],
-                telegram_id=row["telegram_id"],
-                name=row["name"],
-                role=row["role"] if "role" in row.keys() and row["role"] else "trabajador",
-                created_at=row["created_at"],
-            )
+            return self._row_to_user(row) if row is not None else None
 
     def get_user_by_id(self, user_id: int) -> User | None:
         """Find a user by their internal ID."""
@@ -181,77 +197,78 @@ class Repository:
                 "SELECT * FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
-            if row is None:
-                return None
-            return User(
-                id=row["id"],
-                telegram_id=row["telegram_id"],
-                name=row["name"],
-                role=row["role"] if "role" in row.keys() and row["role"] else "trabajador",
-                created_at=row["created_at"],
-            )
+            return self._row_to_user(row) if row is not None else None
 
-    def set_user_role(self, telegram_id_or_id: int, role: str) -> None:
-        """Update role for a user by telegram_id or internal ID."""
+    def set_user_role(
+        self,
+        telegram_id_or_id: int,
+        role: str,
+        admin_source: str | None = None,
+    ) -> None:
+        """Update role (and provenance) for a user by telegram_id or internal ID."""
+        if role != "admin":
+            effective_source = ""
+        elif admin_source is not None:
+            effective_source = admin_source
+        else:
+            effective_source = "bot"
+
         with self._connect() as conn:
             conn.execute(
-                "UPDATE users SET role = ? WHERE telegram_id = ? OR id = ?",
-                (role, telegram_id_or_id, telegram_id_or_id),
+                "UPDATE users SET role = ?, admin_source = ? WHERE telegram_id = ? OR id = ?",
+                (role, effective_source, telegram_id_or_id, telegram_id_or_id),
             )
 
     def sync_admin_roles(self, admin_telegram_ids: tuple[int, ...] | set[int]) -> tuple[int, int]:
-        """Synchronize DB roles so ADMIN_TELEGRAM_IDS is the single source of truth.
+        """Synchronize .env superadmins while preserving bot-promoted admins.
 
-        Promotes real users in admin_telegram_ids to 'admin' and demotes anyone else
-        who still had role='admin' in SQLite back to 'trabajador'.
+        - Users in ADMIN_TELEGRAM_IDS are ensured role='admin', admin_source='env'.
+        - Users removed from ADMIN_TELEGRAM_IDS whose admin_source is 'env' or '' (legacy)
+          are demoted back to 'trabajador'.
+        - Users promoted explicitly inside Telegram (admin_source='bot') persist across restarts.
         Returns (promoted_count, demoted_count).
         """
         admin_set = {tid for tid in admin_telegram_ids if tid > 0}
         promoted = 0
         demoted = 0
         with self._connect() as conn:
-            rows = conn.execute("SELECT id, telegram_id, role FROM users").fetchall()
+            rows = conn.execute("SELECT id, telegram_id, role, admin_source FROM users").fetchall()
             for row in rows:
                 tid = row["telegram_id"]
                 current_role = row["role"] or "trabajador"
-                should_be_admin = tid in admin_set
-                if should_be_admin and current_role != "admin":
-                    conn.execute("UPDATE users SET role = 'admin' WHERE id = ?", (row["id"],))
-                    promoted += 1
-                elif not should_be_admin and current_role == "admin":
-                    conn.execute("UPDATE users SET role = 'trabajador' WHERE id = ?", (row["id"],))
-                    demoted += 1
+                current_source = row["admin_source"] or ""
+                if tid in admin_set:
+                    if current_role != "admin":
+                        conn.execute(
+                            "UPDATE users SET role = 'admin', admin_source = 'env' WHERE id = ?",
+                            (row["id"],),
+                        )
+                        promoted += 1
+                    elif current_source != "env":
+                        conn.execute(
+                            "UPDATE users SET admin_source = 'env' WHERE id = ?",
+                            (row["id"],),
+                        )
+                else:
+                    if current_role == "admin" and current_source != "bot":
+                        conn.execute(
+                            "UPDATE users SET role = 'trabajador', admin_source = '' WHERE id = ?",
+                            (row["id"],),
+                        )
+                        demoted += 1
         return promoted, demoted
 
     def get_all_users(self) -> list[User]:
         """Get all registered users ordered by ID."""
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM users ORDER BY id ASC").fetchall()
-            return [
-                User(
-                    id=row["id"],
-                    telegram_id=row["telegram_id"],
-                    name=row["name"],
-                    role=row["role"] if "role" in row.keys() and row["role"] else "trabajador",
-                    created_at=row["created_at"],
-                )
-                for row in rows
-            ]
+            return [self._row_to_user(row) for row in rows]
 
     def get_admins(self) -> list[User]:
         """Get all users with admin role."""
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM users WHERE role = 'admin' ORDER BY id ASC").fetchall()
-            return [
-                User(
-                    id=row["id"],
-                    telegram_id=row["telegram_id"],
-                    name=row["name"],
-                    role="admin",
-                    created_at=row["created_at"],
-                )
-                for row in rows
-            ]
+            return [self._row_to_user(row) for row in rows]
 
     def create_dummy_worker(self, name: str) -> User:
         """Create a mock/test worker with a negative telegram_id for testing without a second phone."""

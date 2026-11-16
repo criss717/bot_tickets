@@ -305,26 +305,32 @@ class TestUnassignmentDeletionAndDeduplication:
         # 5. Old data ticket outside 90-day window ignored
         assert repo.find_duplicate_by_data("Antiguo Bar SL", 15.0, "01/01/2025", days_window=90) is None
 
-    def test_sync_admin_roles_promotes_and_demotes(self, repo: Repository):
-        ex_admin = repo.create_user(telegram_id=101, name="Ex Jefa", role="admin")
-        new_admin = repo.create_user(telegram_id=202, name="Nueva Jefa", role="trabajador")
+    def test_sync_admin_roles_promotes_demotes_and_preserves_bot_admins(self, repo: Repository):
+        ex_env_admin = repo.create_user(telegram_id=101, name="Ex Admin Env", role="admin", admin_source="env")
+        new_env_admin = repo.create_user(telegram_id=202, name="Nuevo Admin Env", role="trabajador")
+        bot_admin = repo.create_user(telegram_id=404, name="Lucia Bot Admin", role="trabajador")
+        repo.set_user_role(bot_admin.id, "admin", admin_source="bot")
         worker = repo.create_user(telegram_id=303, name="Currito", role="trabajador")
         dummy = repo.create_dummy_worker("Sin Telegram")
 
-        # Promote 202 and demote 101 (removed from .env ADMIN_TELEGRAM_IDS)
+        # Promote 202 from .env, demote 101 removed from .env, and KEEP 404 promoted via bot
         promoted, demoted = repo.sync_admin_roles((202,))
         assert promoted == 1
         assert demoted == 1
-        assert repo.get_user_by_id(ex_admin.id).role == "trabajador"
-        assert repo.get_user_by_id(new_admin.id).role == "admin"
+        assert repo.get_user_by_id(ex_env_admin.id).role == "trabajador"
+        assert repo.get_user_by_id(new_env_admin.id).role == "admin"
+        assert repo.get_user_by_id(new_env_admin.id).admin_source == "env"
+        assert repo.get_user_by_id(bot_admin.id).role == "admin"
+        assert repo.get_user_by_id(bot_admin.id).admin_source == "bot"
         assert repo.get_user_by_id(worker.id).role == "trabajador"
         assert repo.get_user_by_id(dummy.id).role == "trabajador"
-        assert [u.telegram_id for u in repo.get_admins()] == [202]
+        assert {u.telegram_id for u in repo.get_admins()} == {202, 404}
 
-        # Empty ADMIN_TELEGRAM_IDS removes all admin roles from SQLite
+        # Removing 202 from .env demotes 202, while keeping bot-promoted 404
         promoted2, demoted2 = repo.sync_admin_roles(())
         assert promoted2 == 0
         assert demoted2 == 1
-        assert repo.get_user_by_id(new_admin.id).role == "trabajador"
-        assert repo.get_admins() == []
+        assert repo.get_user_by_id(new_env_admin.id).role == "trabajador"
+        assert repo.get_user_by_id(bot_admin.id).role == "admin"
+        assert [u.telegram_id for u in repo.get_admins()] == [404]
 

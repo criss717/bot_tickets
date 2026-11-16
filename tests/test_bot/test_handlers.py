@@ -424,8 +424,8 @@ class TestRBACAndAccountingHandlers:
         assert len(kb.keyboard) == 2  # Worker 2x2 keyboard (no admin buttons, no sync)
         assert repo.get_user_by_id(stale_ex_admin.id).role == "trabajador"
 
-        # 2. Reset DB role back to stale admin and simulate /start: must also demote cleanly
-        repo.set_user_role(stale_ex_admin.id, "admin")
+        # 2. Reset DB role back to stale .env admin and simulate /start: must also demote cleanly
+        repo.set_user_role(stale_ex_admin.id, "admin", admin_source="env")
         start_handler = next(
             h.callback
             for obs in router.observers.values()
@@ -438,6 +438,76 @@ class TestRBACAndAccountingHandlers:
         await start_handler(msg_start)
         assert "Trabajador" in msg_start.answer.call_args[0][0]
         assert repo.get_user_by_id(stale_ex_admin.id).role == "trabajador"
+
+    @pytest.mark.asyncio
+    async def test_bot_promoted_admin_persists_and_receives_live_keyboard_and_commands(
+        self, repo: Repository, tmp_path: Path
+    ):
+        repo.create_user(telegram_id=999, name="Superadmin", role="admin", admin_source="env")
+        lucia = repo.create_user(telegram_id=555, name="Lucia", role="trabajador")
+
+        mock_bot = MagicMock(spec=Bot)
+        mock_bot.send_message = AsyncMock()
+        mock_bot.set_my_commands = AsyncMock()
+        mock_bot.delete_my_commands = AsyncMock()
+        mock_extractor = MagicMock(spec=VisionExtractor)
+        router = create_router(
+            repo, mock_extractor, mock_bot, tmp_path / "img", tmp_path / "t.xlsx", admin_telegram_ids=(999,)
+        )
+
+        # 1. Superadmin promotes Lucia via inline button wrk_role
+        role_handler = next(
+            h.callback
+            for obs in router.observers.values()
+            for h in obs.handlers
+            if "handle_worker_toggle_role" in getattr(h.callback, "__name__", "")
+        )
+        cb_promote = MagicMock()
+        cb_promote.data = f"wrk_role:{lucia.id}:admin"
+        cb_promote.from_user = TgUser(id=999, is_bot=False, first_name="Superadmin")
+        cb_promote.message = MagicMock()
+        cb_promote.message.edit_text = AsyncMock()
+        cb_promote.answer = AsyncMock()
+        await role_handler(cb_promote)
+
+        updated_lucia = repo.get_user_by_id(lucia.id)
+        assert updated_lucia.role == "admin"
+        assert updated_lucia.admin_source == "bot"
+        assert mock_bot.set_my_commands.called
+        # Live push message sent to Lucia with 3-row admin keyboard
+        mock_bot.send_message.assert_called()
+        push_kwargs = mock_bot.send_message.call_args.kwargs
+        assert push_kwargs["chat_id"] == 555
+        assert len(push_kwargs["reply_markup"].keyboard) == 3
+
+        # 2. Lucia can open Panel Admin even though she is not in .env ADMIN_TELEGRAM_IDS
+        panel_handler = next(
+            h.callback
+            for obs in router.observers.values()
+            for h in obs.handlers
+            if "handle_boss_panel" in getattr(h.callback, "__name__", "")
+        )
+        msg_panel = MagicMock(spec=Message)
+        msg_panel.from_user = TgUser(id=555, is_bot=False, first_name="Lucia")
+        msg_panel.answer = AsyncMock()
+        await panel_handler(msg_panel)
+        assert "Panel Admin" in msg_panel.answer.call_args[0][0]
+
+        # 3. Demote Lucia via bot -> loses admin, deletes commands, gets 2-row worker keyboard
+        mock_bot.send_message.reset_mock()
+        cb_demote = MagicMock()
+        cb_demote.data = f"wrk_role:{lucia.id}:trabajador"
+        cb_demote.from_user = TgUser(id=999, is_bot=False, first_name="Superadmin")
+        cb_demote.message = MagicMock()
+        cb_demote.message.edit_text = AsyncMock()
+        cb_demote.answer = AsyncMock()
+        await role_handler(cb_demote)
+
+        demoted_lucia = repo.get_user_by_id(lucia.id)
+        assert demoted_lucia.role == "trabajador"
+        assert demoted_lucia.admin_source == ""
+        assert mock_bot.delete_my_commands.called
+        assert len(mock_bot.send_message.call_args.kwargs["reply_markup"].keyboard) == 2
     @pytest.mark.asyncio
     async def test_worker_cannot_access_boss_panel(self, repo: Repository, tmp_path: Path):
         worker = repo.create_user(telegram_id=111, name="Trabajador", role="trabajador")
